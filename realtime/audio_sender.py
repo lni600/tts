@@ -97,9 +97,12 @@ class PCMTrack(MediaStreamTrack):
                     # Truncate
                     audio_array = audio_array[:self.samples_per_frame]
             
-            # Create AudioFrame
+            # Create AudioFrame - reshape to 2D for PyAV compatibility
+            # PyAV expects (channels, samples) shape
+            audio_array_2d = audio_array.reshape(1, -1)  # 1 channel, N samples
+            
             frame = av.AudioFrame.from_ndarray(
-                audio_array.reshape(-1, 1),  # Reshape to (samples, channels)
+                audio_array_2d,  # 2D array: (channels, samples)
                 format="s16",  # 16-bit signed
                 layout="mono"
             )
@@ -107,7 +110,7 @@ class PCMTrack(MediaStreamTrack):
             # Set frame properties
             frame.sample_rate = self.sample_rate
             frame.pts = self.frame_count * self.samples_per_frame
-            frame.time_base = av.time_base(1, self.sample_rate)
+            # time_base is automatically set by PyAV based on sample_rate
             
             return frame
         
@@ -120,12 +123,13 @@ class PCMTrack(MediaStreamTrack):
         Returns:
             Silence AudioFrame
         """
-        # Generate silence samples
+        # Generate silence samples - reshape to 2D for PyAV compatibility
         silence_samples = np.zeros(self.samples_per_frame, dtype=np.int16)
+        silence_samples_2d = silence_samples.reshape(1, -1)  # 1 channel, N samples
         
         # Create AudioFrame
         frame = av.AudioFrame.from_ndarray(
-            silence_samples.reshape(-1, 1),
+            silence_samples_2d,  # Use 2D array
             format="s16",
             layout="mono"
         )
@@ -133,7 +137,7 @@ class PCMTrack(MediaStreamTrack):
         # Set frame properties
         frame.sample_rate = self.sample_rate
         frame.pts = self.frame_count * self.samples_per_frame
-        frame.time_base = av.time_base(1, self.sample_rate)
+        # time_base is automatically set by PyAV based on sample_rate
         
         return frame
     
@@ -215,17 +219,32 @@ async def test_audio_track():
     queue = asyncio.Queue()
     
     # Create track
-    track = get_track(queue)
+    track = get_track(queue, sample_rate=16000, chunk_duration_ms=20)
     
-    # Put some test audio data
-    test_audio = np.random.randint(-32768, 32767, 320, dtype=np.int16).tobytes()
-    await queue.put(test_audio)
+    # Generate test audio
+    sample_rate = 16000
+    duration_ms = 20
+    samples_per_chunk = int(sample_rate * duration_ms / 1000)
+    
+    # Generate sine wave
+    frequency = 440  # A4 note
+    t = np.linspace(0, duration_ms/1000, samples_per_chunk, False)
+    audio_samples = np.sin(2 * np.pi * frequency * t)
+    
+    # Convert to PCM16
+    pcm16_samples = (audio_samples * 32767).astype(np.int16)
+    audio_bytes = pcm16_samples.tobytes()
+    
+    # Put audio in queue
+    await queue.put(audio_bytes)
     
     # Get frame
     frame = await track.recv()
-    print(f"Generated frame: {frame}")
     
-    track.stop()
+    print(f"Generated frame: {frame}")
+    print(f"Frame shape: {frame.to_ndarray().shape}")
+    print(f"Frame format: {frame.format}")
+    print(f"Frame sample rate: {frame.sample_rate}")
 
 
 if __name__ == "__main__":

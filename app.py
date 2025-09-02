@@ -4,10 +4,8 @@ Streamlit Chatbot with Realtime TTS using ElevenLabs.
 import streamlit as st
 import asyncio
 import os
-import tempfile
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-import time
 
 # Import our modules
 from llm.streaming_llm import create_streaming_llm
@@ -66,12 +64,6 @@ def initialize_session_state():
     if "current_audio_chunks" not in st.session_state:
         st.session_state.current_audio_chunks = []
     
-    if "tts_client" not in st.session_state:
-        st.session_state.tts_client = None
-    
-    if "llm" not in st.session_state:
-        st.session_state.llm = None
-    
     if "audio_queue_manager" not in st.session_state:
         st.session_state.audio_queue_manager = AudioQueueManager()
     
@@ -88,8 +80,8 @@ def get_config_from_secrets():
         "elevenlabs_api_key": st.secrets.get("ELEVENLABS_API_KEY", os.getenv("ELEVENLABS_API_KEY", "")),
         "elevenlabs_voice_id": st.secrets.get("ELEVENLABS_VOICE_ID", os.getenv("ELEVENLABS_VOICE_ID", "default_voice")),
         "openai_api_key": st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")),
-        "use_dummy_llm": st.secrets.get("USE_DUMMY_LLM", os.getenv("USE_DUMMY_LLM", "true")).lower() == "true",
-        "use_dummy_tts": st.secrets.get("USE_DUMMY_TTS", os.getenv("USE_DUMMY_TTS", "true")).lower() == "true",
+        "use_dummy_llm": str(st.secrets.get("USE_DUMMY_LLM", os.getenv("USE_DUMMY_LLM", "true"))).lower() == "true",
+        "use_dummy_tts": str(st.secrets.get("USE_DUMMY_TTS", os.getenv("USE_DUMMY_TTS", "true"))).lower() == "true",
         "available_voices": st.secrets.get("AVAILABLE_VOICES", "default_voice").split(","),
         "tts_sample_rate": int(st.secrets.get("TTS_SAMPLE_RATE", "16000")),
         "tts_chunk_size_ms": int(st.secrets.get("TTS_CHUNK_SIZE_MS", "20"))
@@ -127,7 +119,8 @@ def render_sidebar(config: Dict[str, Any]):
     selected_voice = st.sidebar.selectbox(
         "Voice",
         options=config["available_voices"],
-        index=0 if config["elevenlabs_voice_id"] in config["available_voices"] else 0
+        index=0 if config["elevenlabs_voice_id"] in config["available_voices"] else 0,
+        key="voice_selectbox"
     )
     
     # Feature toggles
@@ -167,48 +160,10 @@ def render_chat_history():
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-async def initialize_services(config: Dict[str, Any], sidebar_config: Dict[str, Any]):
-    """Initialize TTS and LLM services."""
-    try:
-        # Initialize TTS client
-        if not st.session_state.tts_client or st.session_state.connection_status != "connected":
-            st.session_state.connection_status = "connecting"
-            
-            tts_client = create_tts_client(
-                voice_id=sidebar_config["selected_voice"],
-                api_key=config["elevenlabs_api_key"],
-                use_dummy=sidebar_config["use_dummy_tts"],
-                sample_rate=config["tts_sample_rate"]
-            )
-            
-            if await tts_client.connect():
-                st.session_state.tts_client = tts_client
-                st.session_state.connection_status = "connected"
-            else:
-                st.session_state.connection_status = "error"
-                return False
-        
-        # Initialize LLM
-        if not st.session_state.llm:
-            st.session_state.llm = create_streaming_llm(
-                use_dummy=sidebar_config["use_dummy_llm"],
-                openai_api_key=config["openai_api_key"]
-            )
-        
-        return True
-        
-    except Exception as e:
-        st.error(f"Error initializing services: {e}")
-        st.session_state.connection_status = "error"
-        return False
 
 
-async def process_user_message(user_input: str, sidebar_config: Dict[str, Any]):
-    """Process user message and generate streaming response."""
-    if not st.session_state.tts_client or not st.session_state.llm:
-        st.error("Services not initialized!")
-        return
-    
+async def process_user_message(user_input: str, sidebar_config: Dict[str, Any], config: Dict[str, Any]):
+    """Process user message and generate streaming response with synchronized text + audio."""
     # Add user message to history
     user_message = {
         "role": "user",
@@ -217,70 +172,97 @@ async def process_user_message(user_input: str, sidebar_config: Dict[str, Any]):
         "ended_at": datetime.now().isoformat()
     }
     st.session_state.messages.append(user_message)
-    
-    # Clear current audio chunks
     st.session_state.current_audio_chunks = []
-    
-    # Create placeholder for streaming text
+
+    # Placeholder for streaming text
     text_placeholder = st.empty()
-    current_text = ""
-    
-    # Start TTS audio collection
-    audio_collection_task = asyncio.create_task(collect_audio_chunks())
-    
+    current_text_ref = [""]
+
     try:
-        # Stream LLM response
-        async for token in st.session_state.llm.stream_assistant_reply(user_input):
-            current_text += token
-            text_placeholder.markdown(f"**Assistant:** {current_text}")
-            
-            # Send token to TTS
-            await st.session_state.tts_client.send_text_fragment(token)
+        # Create fresh clients inside this loop
+        tts_client = create_tts_client(
+            voice_id=sidebar_config["selected_voice"],
+            api_key=config["elevenlabs_api_key"],
+            use_dummy=sidebar_config["use_dummy_tts"],
+            sample_rate=config["tts_sample_rate"],
+        )
+        llm = create_streaming_llm(
+            use_dummy=sidebar_config["use_dummy_llm"],
+            openai_api_key=config["openai_api_key"],
+        )
+
+        # Connect TTS
+        st.session_state.connection_status = "connecting"
+        ok = await tts_client.connect()
+        if not ok:
+            st.session_state.connection_status = "error"
+            st.error("Failed to connect to TTS service.")
+            return
+        st.session_state.connection_status = "connected"
+
+        # Audio collection task
+        async def collect_audio():
+            try:
+                chunk_count = 0
+                total_bytes = 0
+                async for chunk in tts_client.audio_chunks():
+                    st.session_state.current_audio_chunks.append(chunk)
+                    st.session_state.audio_queue_manager.put_audio(chunk)
+                    chunk_count += 1
+                    total_bytes += len(chunk)
+                    # Audio chunk collected
+                
+                print(f"Audio collection completed: {chunk_count} chunks, {total_bytes} total bytes")
+            except Exception as e:
+                print(f"Error collecting audio: {e}")
+
+        collector_task = asyncio.create_task(collect_audio())
+
+        # Stream text from LLM and send to TTS
+        try:
+            async for token in llm.stream_assistant_reply(user_input):
+                current_text_ref[0] += token
+                text_placeholder.markdown(f"**Assistant:** {current_text_ref[0]}")
+                await tts_client.send_text_fragment(token)
+
+            await tts_client.finalize()
+        finally:
+            await collector_task
+            if hasattr(tts_client, "close"):
+                await tts_client.close()
+
+        # Save final assistant message + audio
+        current_text = current_text_ref[0]
+        audio_path = ""
         
-        # Finalize TTS
-        await st.session_state.tts_client.finalize()
-        
-        # Wait for audio collection to complete
-        await audio_collection_task
-        
-        # Save audio file
         if st.session_state.current_audio_chunks:
             audio_path = save_audio_chunks(st.session_state.current_audio_chunks)
-            
-            # Add assistant message to history
-            assistant_message = {
-                "role": "assistant",
-                "text": current_text,
-                "audio_path": audio_path,
-                "started_at": datetime.now().isoformat(),
-                "ended_at": datetime.now().isoformat()
-            }
-            st.session_state.messages.append(assistant_message)
-            
-            # Update the placeholder with final message
-            text_placeholder.markdown(f"**Assistant:** {current_text}")
-            
-            # Show audio player
+        else:
+            print("No audio chunks to save!")
+
+        assistant_message = {
+            "role": "assistant",
+            "text": current_text,
+            "audio_path": audio_path,
+            "started_at": datetime.now().isoformat(),
+            "ended_at": datetime.now().isoformat(),
+        }
+        st.session_state.messages.append(assistant_message)
+
+        text_placeholder.markdown(f"**Assistant:** {current_text}")
+        if audio_path:
             st.audio(audio_path, format="audio/wav")
-        
+        else:
+            st.warning("⚠️ Audio was generated but could not be saved/displayed")
+
     except Exception as e:
         st.error(f"Error processing message: {e}")
-        if not audio_collection_task.done():
-            audio_collection_task.cancel()
-
-
-async def collect_audio_chunks():
-    """Collect audio chunks from TTS client."""
-    try:
-        async for chunk in st.session_state.tts_client.audio_chunks():
-            st.session_state.current_audio_chunks.append(chunk)
-            
-            # Put chunk in audio queue for WebRTC
-            if st.session_state.audio_queue_manager:
-                st.session_state.audio_queue_manager.put_audio(chunk)
-                
-    except Exception as e:
-        st.error(f"Error collecting audio: {e}")
+        # Clean up TTS client on error
+        try:
+            if 'tts_client' in locals() and hasattr(tts_client, "close"):
+                await tts_client.close()
+        except:
+            pass
 
 
 def save_audio_chunks(chunks: List[bytes]) -> str:
@@ -298,7 +280,12 @@ def save_audio_chunks(chunks: List[bytes]) -> str:
         # Write WAV file
         write_wav(chunks, filepath, sample_rate=16000)
         
-        return filepath
+        # Verify file was created
+        if os.path.exists(filepath):
+            return filepath
+        else:
+            print("Error: Audio file was not created!")
+            return ""
         
     except Exception as e:
         st.error(f"Error saving audio: {e}")
@@ -341,73 +328,59 @@ def render_webrtc_player():
         ]
     })
     
+    audio_queue = st.session_state.audio_queue_manager.create_queue()
+    track = get_track(audio_queue, sample_rate=16000, chunk_duration_ms=20)
+
     # Create WebRTC streamer
-    webrtc_ctx = webrtc_streamer(
+    webrtc_streamer(
         key="audio-player",
         mode=WebRtcMode.RECVONLY,
-        rtc_configuration=rtc_configuration,
+        frontend_rtc_configuration=rtc_configuration,
+        server_rtc_configuration=rtc_configuration,
         media_stream_constraints={"video": False, "audio": True},
+        source_audio_track=track,
         async_processing=True,
     )
-    
-    # Attach audio track when playing
-    if webrtc_ctx.state.playing:
-        if not hasattr(webrtc_ctx, 'audio_track_attached'):
-            # Create audio track from queue
-            audio_queue = st.session_state.audio_queue_manager.create_queue()
-            audio_track = get_track(audio_queue, sample_rate=16000, chunk_duration_ms=20)
-            
-            # Add track to peer connection
-            webrtc_ctx.addTrack(audio_track)
-            webrtc_ctx.audio_track_attached = True
 
 
 def main():
     """Main application function."""
     # Initialize session state
     initialize_session_state()
-    
+
     # Get configuration
     config = get_config_from_secrets()
-    
+
     # Render header
     render_header()
-    
+
     # Render sidebar
     sidebar_config = render_sidebar(config)
-    
-    # Initialize services
-    if st.button("🔄 Initialize Services"):
-        with st.spinner("Initializing services..."):
-            success = asyncio.run(initialize_services(config, sidebar_config))
-            if success:
-                st.success("Services initialized successfully!")
-            else:
-                st.error("Failed to initialize services!")
-    
+
     # Render chat history
     render_chat_history()
-    
+
     # Chat input
     if prompt := st.chat_input("Type your message here..."):
-        if st.session_state.connection_status == "connected":
-            # Process message asynchronously
-            asyncio.run(process_user_message(prompt, sidebar_config))
+        if True:  # We always recreate services per message
+            try:
+                asyncio.run(process_user_message(prompt, sidebar_config, config))
+            except Exception as e:
+                st.error(f"Error processing message: {e}")
         else:
             st.error("Please initialize services first!")
-    
+
     # WebRTC audio player
     render_webrtc_player()
-    
-    # Debug info
-    with st.expander("🔧 Debug Info"):
+
+    # System status
+    with st.expander("🔧 System Status"):
         st.json({
             "connection_status": st.session_state.connection_status,
             "message_count": len(st.session_state.messages),
-            "current_audio_chunks": len(st.session_state.current_audio_chunks),
-            "tts_client_connected": st.session_state.tts_client is not None,
-            "llm_initialized": st.session_state.llm is not None
+            "audio_chunks_ready": len(st.session_state.current_audio_chunks) > 0,
         })
+
 
 
 if __name__ == "__main__":
