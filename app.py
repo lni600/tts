@@ -10,6 +10,9 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from queue import Queue, Empty
 from fractions import Fraction
+import toml
+import tempfile
+import json
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -189,17 +192,83 @@ def initialize_session_state():
         st.session_state.transcription_timeout = False
 
 
-def get_config_from_secrets():
-    """Get configuration from Streamlit secrets or environment variables."""
-    config = {
-        "elevenlabs_api_key": st.secrets.get("ELEVENLABS_API_KEY", os.getenv("ELEVENLABS_API_KEY", "")),
-        "elevenlabs_voice_id": st.secrets.get("ELEVENLABS_VOICE_ID", os.getenv("ELEVENLABS_VOICE_ID", "default_voice")),
-        "openai_api_key": st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")),
+def load_config_from_file(file_content: str, file_type: str) -> Dict[str, Any]:
+    """Load configuration from uploaded file content."""
+    try:
+        if file_type == "toml":
+            raw_config = toml.loads(file_content)
+        elif file_type == "json":
+            raw_config = json.loads(file_content)
+        else:
+            raise ValueError(f"Unsupported file type: {file_type}")
+        
+        # Flatten nested config structure
+        flattened_config = {}
+        
+        # Handle nested structures like [api_keys] and [tts_settings]
+        for key, value in raw_config.items():
+            if isinstance(value, dict):
+                # If it's a nested dict, flatten it
+                for nested_key, nested_value in value.items():
+                    flattened_config[nested_key] = nested_value
+            else:
+                # Direct key-value pair
+                flattened_config[key] = value
+        
+        return flattened_config
+        
+    except Exception as e:
+        st.error(f"Error parsing config file: {str(e)}")
+        return {}
 
-        "available_voices": st.secrets.get("AVAILABLE_VOICES", "default_voice").split(","),
-        "tts_sample_rate": int(st.secrets.get("TTS_SAMPLE_RATE", "16000")),
-        "tts_chunk_size_ms": int(st.secrets.get("TTS_CHUNK_SIZE_MS", "20"))
+
+def get_config_from_secrets():
+    """Get configuration with fallback priority: secrets.toml -> uploaded config -> environment variables."""
+    # Default config structure
+    default_config = {
+        "elevenlabs_api_key": "",
+        "elevenlabs_voice_id": "default_voice",
+        "openai_api_key": "",
+        "available_voices": ["default_voice"],
+        "tts_sample_rate": 16000,
+        "tts_chunk_size_ms": 20
     }
+    
+    # Priority 1: Streamlit secrets (secrets.toml) - handle missing secrets gracefully
+    try:
+        # Check if secrets.toml exists by trying to access it
+        _ = st.secrets.get("ELEVENLABS_API_KEY", "")
+        # If we get here, secrets.toml exists, so use it
+        config = {
+            "elevenlabs_api_key": st.secrets.get("ELEVENLABS_API_KEY", ""),
+            "elevenlabs_voice_id": st.secrets.get("ELEVENLABS_VOICE_ID", "default_voice"),
+            "openai_api_key": st.secrets.get("OPENAI_API_KEY", ""),
+            "available_voices": st.secrets.get("AVAILABLE_VOICES", "default_voice").split(","),
+            "tts_sample_rate": int(st.secrets.get("TTS_SAMPLE_RATE", "16000")),
+            "tts_chunk_size_ms": int(st.secrets.get("TTS_CHUNK_SIZE_MS", "20"))
+        }
+    except Exception:
+        # If secrets.toml is missing or invalid, start with default config
+        config = default_config.copy()
+    
+    # Priority 2: Uploaded config file (if available)
+    if "uploaded_config" in st.session_state and st.session_state.uploaded_config:
+        uploaded_config = st.session_state.uploaded_config
+        # Merge uploaded config, only override if values are not empty
+        for key, value in uploaded_config.items():
+            if value and value != "" and value != []:
+                config[key] = value
+    
+    # Priority 3: Environment variables (fallback)
+    for key in ["elevenlabs_api_key", "openai_api_key"]:
+        if not config[key]:
+            config[key] = os.getenv(key.upper(), "")
+    
+    # Ensure required fields have defaults
+    for key, default_value in default_config.items():
+        if key not in config or not config[key]:
+            config[key] = default_value
+    
     return config
 
 
@@ -228,6 +297,102 @@ def render_header():
 def render_sidebar(config: Dict[str, Any]):
     """Render the sidebar with controls."""
     st.sidebar.title("🎛️ Controls")
+    
+    # Configuration Upload Section
+    st.sidebar.markdown("### 🔧 Configuration")
+    
+    # Initialize uploaded config in session state
+    if "uploaded_config" not in st.session_state:
+        st.session_state.uploaded_config = None
+    
+    # File uploader for config
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload Config File",
+        type=['toml', 'json'],
+        help="Upload a TOML or JSON config file with your API keys. This will override secrets.toml if present.",
+        key="config_uploader"
+    )
+    
+    if uploaded_file is not None:
+        try:
+            # Read file content
+            file_content = uploaded_file.read().decode('utf-8')
+            file_type = uploaded_file.name.split('.')[-1].lower()
+            
+            # Parse config
+            parsed_config = load_config_from_file(file_content, file_type)
+            
+            if parsed_config:
+                st.session_state.uploaded_config = parsed_config
+                # Update the main config in session state with the new uploaded config
+                st.session_state.config = get_config_from_secrets()
+                st.sidebar.success(f"✅ Config loaded from {uploaded_file.name}")
+                
+                # Show loaded config summary
+                with st.sidebar.expander("📋 Loaded Configuration", expanded=False):
+                    for key, value in parsed_config.items():
+                        if "api_key" in key.lower():
+                            # Mask API keys for security
+                            masked_value = f"{value[:8]}..." if value and len(value) > 8 else "Not set"
+                            st.write(f"**{key}**: {masked_value}")
+                        else:
+                            st.write(f"**{key}**: {value}")
+            else:
+                st.sidebar.error("❌ Failed to parse config file")
+                
+        except Exception as e:
+            st.sidebar.error(f"❌ Error loading config: {str(e)}")
+    
+    # Clear config button
+    if st.session_state.uploaded_config:
+        if st.sidebar.button("🗑️ Clear Uploaded Config", type="secondary"):
+            st.session_state.uploaded_config = None
+            # Update the main config in session state after clearing uploaded config
+            st.session_state.config = get_config_from_secrets()
+            st.sidebar.success("Config cleared")
+            st.rerun()
+    
+    # Show config source status
+    try:
+        # Check if secrets.toml exists by trying to access it
+        _ = st.secrets.get("ELEVENLABS_API_KEY", "")
+        has_secrets = True
+    except Exception:
+        has_secrets = False
+    
+    if has_secrets and not st.session_state.uploaded_config:
+        config_source = "secrets.toml"
+        st.sidebar.info(f"📁 Using config from: {config_source}")
+    elif st.session_state.uploaded_config:
+        config_source = "uploaded file"
+        st.sidebar.info(f"📁 Using config from: {config_source}")
+    else:
+        st.sidebar.warning("⚠️ No config found! Please upload a config file below.")
+    
+    # Sample config download
+    sample_config_toml = """# Sample Configuration File
+# Copy this file and fill in your API keys
+
+[api_keys]
+elevenlabs_api_key = "your_elevenlabs_api_key_here"
+openai_api_key = "your_openai_api_key_here"
+
+[tts_settings]
+elevenlabs_voice_id = "default_voice"
+available_voices = ["voice1", "voice2", "voice3"]
+tts_sample_rate = 16000
+tts_chunk_size_ms = 20
+"""
+    
+    st.sidebar.download_button(
+        "📥 Download Sample Config",
+        sample_config_toml,
+        file_name="sample_config.toml",
+        mime="text/plain",
+        help="Download a sample TOML config file template"
+    )
+    
+    st.sidebar.markdown("---")
     
     # Voice selection
     selected_voice = st.sidebar.selectbox(
@@ -537,12 +702,25 @@ def render_stt_interface():
     """Render Speech-to-Text interface."""
     st.subheader("🎤 Voice Input")
     
-    # Initialize STT service if not already done
-    if st.session_state.stt_service is None:
+    # Initialize STT service if not already done or if config changed
+    current_api_key = st.session_state.config.get("openai_api_key", "")
+    if (st.session_state.stt_service is None or 
+        not hasattr(st.session_state, 'last_openai_api_key') or 
+        st.session_state.last_openai_api_key != current_api_key):
+        
+        # Clean up existing service if it exists
+        if st.session_state.stt_service:
+            try:
+                st.session_state.stt_service.close()
+            except:
+                pass
+            st.session_state.stt_service = None
+        
         try:
             st.session_state.stt_service = create_stt_service(
-                api_key=st.session_state.config["openai_api_key"]
+                api_key=current_api_key
             )
+            st.session_state.last_openai_api_key = current_api_key
             
             # Set up transcription callback
             def on_transcription(text):
@@ -874,8 +1052,12 @@ def main():
     # Initialize session state
     initialize_session_state()
 
-    # Get configuration
-    config = get_config_from_secrets()
+    # Get configuration - handle missing secrets gracefully
+    try:
+        config = get_config_from_secrets()
+    except Exception as e:
+        st.error(f"Configuration error: {e}")
+        st.stop()
 
     # Create audio generator with correct sample rate & frame size
     if "audio_frame_generator" not in st.session_state:
