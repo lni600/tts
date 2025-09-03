@@ -38,20 +38,25 @@ import signal
 from contextlib import contextmanager
 import atexit
 
-# More robust WebRTC configuration with multiple STUN servers and better error handling
-RTC_CFG = RTCConfiguration({
+# Frontend/browser ICE: keep STUN here
+FRONTEND_RTC_CFG = RTCConfiguration({
     "iceServers": [
-        {"urls": ["stun:stun.l.google.com:19302"]},
-        {"urls": ["stun:stun1.l.google.com:19302"]},
-        {"urls": ["stun:stun2.l.google.com:19302"]},
-        {"urls": ["stun:stun3.l.google.com:19302"]},
-        {"urls": ["stun:stun4.l.google.com:19302"]},
+        {"urls": ["stun:stun.l.google.com:19302",
+                  "stun:stun1.l.google.com:19302",
+                  "stun:stun2.l.google.com:19302",
+                  "stun:stun3.l.google.com:19302",
+                  "stun:stun4.l.google.com:19302"]},
     ],
+    # Keep browser-only tweaks here if you want:
     "iceCandidatePoolSize": 10,
     "iceTransportPolicy": "all",
     "bundlePolicy": "max-bundle",
     "rtcpMuxPolicy": "require",
 })
+
+# Server/aiortc ICE: NO STUN, keep it simple
+SERVER_RTC_CFG = RTCConfiguration({"iceServers": []})  # or just omit server_rtc_configuration
+
 audio_chunk_queue = Queue()
 
 if "mic_pcm_q" not in st.session_state:
@@ -165,8 +170,8 @@ def safe_webrtc_streamer(*args, **kwargs):
     """Safely create a WebRTC streamer with error handling."""
     try:
         # Add timeout and better error handling
-        kwargs.setdefault('frontend_rtc_configuration', RTC_CFG)
-        kwargs.setdefault('server_rtc_configuration', RTC_CFG)
+        kwargs.setdefault('frontend_rtc_configuration', FRONTEND_RTC_CFG)
+        kwargs.setdefault('server_rtc_configuration', SERVER_RTC_CFG)
         kwargs.setdefault('media_stream_constraints', {"video": False, "audio": True})
         kwargs.setdefault('async_processing', True)
         
@@ -777,8 +782,8 @@ def render_webrtc_player():
                 mode=WebRtcMode.RECVONLY,
                 source_audio_track=st.session_state.audio_frame_generator,  # server → browser
                 media_stream_constraints={"video": False, "audio": False},
-                frontend_rtc_configuration=RTC_CFG,
-                server_rtc_configuration=RTC_CFG,
+                frontend_rtc_configuration=FRONTEND_RTC_CFG,
+                server_rtc_configuration=SERVER_RTC_CFG,
                 async_processing=True,
                 sendback_audio=False,                          # avoid echo
             )
@@ -867,15 +872,15 @@ def render_stt_interface():
                     "sampleRate": 16000
                 }
             },
-            frontend_rtc_configuration=RTC_CFG,
-            server_rtc_configuration=RTC_CFG,
+            frontend_rtc_configuration=FRONTEND_RTC_CFG,
+            server_rtc_configuration=SERVER_RTC_CFG,
             async_processing=True,
             queued_audio_frames_callback=on_audio_frames,  # mic → STT
             audio_receiver_size=8,                         # small buffer
             sendback_audio=False,                          # avoid echo
         )
     except Exception as e:
-        logger.error(f"Failed to create microphone WebRTC streamer: {e}")
+        logger.error(f"Failed to create micropho    ne WebRTC streamer: {e}")
         import traceback
         logger.error(f"WebRTC error traceback: {traceback.format_exc()}")
         webrtc_ctx = None
