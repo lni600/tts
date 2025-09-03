@@ -12,3 +12,4 @@ openai>=1.102.0
 streamlit-mic-recorder>=0.0.8
 soundfile>=0.12.1
 toml>=0.10.2
+scipy>=1.16.1

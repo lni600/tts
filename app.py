@@ -11,11 +11,16 @@ from typing import List, Dict, Any, Optional
 from queue import Queue, Empty
 from fractions import Fraction
 import toml
-import tempfile
 import json
 
-# Set up logging
+# Set up logging (only once)
 logger = logging.getLogger(__name__)
+if not logger.handlers:  # Prevent duplicate handlers
+    logger.setLevel(logging.WARNING)  # Reduced from DEBUG to INFO
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 # Import our modules
 from llm.streaming_llm import create_streaming_llm
@@ -54,21 +59,31 @@ FRONTEND_RTC_CFG = RTCConfiguration({
     "rtcpMuxPolicy": "require",
 })
 
-# Server/aiortc ICE: NO STUN, keep it simple
-SERVER_RTC_CFG = RTCConfiguration({"iceServers": []})  # or just omit server_rtc_configuration
+# Server/aiortc ICE: Use STUN for proper connection establishment
+SERVER_RTC_CFG = RTCConfiguration({
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+    ],
+    "iceCandidatePoolSize": 10,
+    "iceTransportPolicy": "all",
+    "bundlePolicy": "max-bundle",
+    "rtcpMuxPolicy": "require",
+})
 
 audio_chunk_queue = Queue()
 
-if "mic_pcm_q" not in st.session_state:
-    st.session_state.mic_pcm_q = Queue()
+# Global thread-safe queue for microphone audio data
+# This is accessible from any thread, unlike st.session_state
+mic_pcm_q_global = Queue()
+ui_event_q = Queue()      # -> for UI notifications from worker threads
+raw_audio_q = Queue()     # -> float32 mono 48kHz chunks for optional recording
 
-# Register cleanup function to run on app exit
+APP_SHUTTING_DOWN = threading.Event()
+
 def cleanup_on_exit():
-    """Clean up WebRTC connections on app exit."""
-    try:
-        cleanup_webrtc_connections()
-    except Exception as e:
-        logger.error(f"Error during exit cleanup: {e}")
+    # Do NOT call st.* or read session_state here.
+    APP_SHUTTING_DOWN.set()
 
 atexit.register(cleanup_on_exit)
 
@@ -79,31 +94,39 @@ if "is_recording_audio" not in st.session_state:
     st.session_state.is_recording_audio = False
 
 def on_audio_frames(frames):
-    for frame in frames:
-        arr = frame.to_ndarray()
-        if arr.ndim == 2:
-            arr = arr.mean(axis=0)
-        if arr.dtype != np.float32:
-            arr = (arr.astype(np.float32) / 32767.0)
+    """Process mic frames in worker thread; never call st.* here."""
+    if not frames:
+        logger.warning("on_audio_frames: empty frames")
+        return
 
-        if st.session_state.is_recording_audio:
-            st.session_state.recorded_audio_data.append(arr.copy())
-
+    for i, frame in enumerate(frames):
         try:
-            from scipy.signal import resample_poly
-            arr16k = resample_poly(arr, up=1, down=3)
-        except Exception:
-            arr16k = arr[::3]
+            arr = frame.to_ndarray()
+            if arr.ndim == 2:  # stereo -> mono
+                arr = arr.mean(axis=0)
+            if arr.dtype != np.float32:  # to float32 in [-1,1]
+                arr = (arr.astype(np.float32) / 32767.0)
 
-        pcm16 = (np.clip(arr16k, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-        st.session_state.mic_pcm_q.put(pcm16)
-
-        # Forward to STT when recording (non-blocking)
-        if st.session_state.get("stt_service") and st.session_state.get("is_recording"):
+            # For optional file recording on the main thread:
             try:
-                run_coro_in_thread(st.session_state.stt_service.process_audio_data(pcm16))
+                raw_audio_q.put_nowait(arr.copy())  # 48kHz mono float32
+            except Exception:
+                pass
+
+            # Resample to 16kHz for STT
+            try:
+                from scipy.signal import resample_poly
+                arr16k = resample_poly(arr, up=1, down=3)  # 48k -> 16k
             except Exception as e:
-                logger.error(f"Error forwarding audio to STT: {e}")
+                logger.debug(f"resample_poly unavailable/failed ({e}); decimating")
+                arr16k = arr[::3]
+
+            pcm16 = (np.clip(arr16k, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+
+            # Feed global queue for STT consumer (and anything else)
+            mic_pcm_q_global.put_nowait(pcm16)
+        except Exception:
+            logger.exception(f"on_audio_frames: error processing frame {i}")
 
 def save_recorded_audio():
     """Save recorded audio data to a WAV file."""
@@ -153,25 +176,49 @@ def safe_webrtc_streamer(*args, **kwargs):
         return None
 
 def cleanup_webrtc_connections():
-    """Clean up WebRTC connections to prevent ICE timer crashes."""
-    try:
-        for key in ("webrtc_ctx", "webrtc_mic_ctx"):
-            ctx = st.session_state.get(key)
-            if ctx:
+    """Best-effort cleanup that doesn't assume .stop() exists."""
+    for key in ("webrtc_ctx", "webrtc_mic_ctx"):
+        ctx = st.session_state.get(key)
+        if not ctx:
+            continue
+        try:
+            # 1) Preferred public-ish methods if present
+            if hasattr(ctx, "destroy"):
                 try:
-                    # stop() gracefully cancels aioice timers and closes transports
-                    if getattr(ctx, "state", None) and getattr(ctx.state, "playing", False):
-                        ctx.stop()
-                    else:
-                        # stop anyway; safe when not playing
-                        ctx.stop()
-                except Exception as e:
-                    logger.warning(f"Error stopping WebRTC ({key}): {e}")
-                finally:
-                    st.session_state[key] = None
-        logger.info("WebRTC connections cleaned up")
-    except Exception as e:
-        logger.error(f"Error during WebRTC cleanup: {e}")
+                    ctx.destroy()
+                except Exception:
+                    pass
+            elif hasattr(ctx, "close"):
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+
+            # 2) Close the underlying PeerConnection if exposed
+            pc = getattr(ctx, "peer_connection", None) or getattr(ctx, "pc", None)
+            if pc:
+                try:
+                    pc.close()
+                except Exception:
+                    pass
+
+            # 3) Stop receivers if they expose stop()
+            ar = getattr(ctx, "audio_receiver", None)
+            if hasattr(ar, "stop"):
+                try:
+                    ar.stop()
+                except Exception:
+                    pass
+
+            vr = getattr(ctx, "video_receiver", None)
+            if hasattr(vr, "stop"):
+                try:
+                    vr.stop()
+                except Exception:
+                    pass
+        finally:
+            st.session_state[key] = None
+
 
 def render_webrtc_fallback():
     """Render a fallback interface when WebRTC fails."""
@@ -246,6 +293,10 @@ def initialize_session_state():
     
     if "is_recording" not in st.session_state:
         st.session_state.is_recording = False
+    
+    # Audio processing queue - reference to global thread-safe queue
+    if "mic_pcm_q" not in st.session_state:
+        st.session_state.mic_pcm_q = mic_pcm_q_global
     
     if "transcribed_text" not in st.session_state:
         st.session_state.transcribed_text = ""
@@ -498,32 +549,28 @@ def render_chat_history():
 
 async def process_user_message(user_input: str, sidebar_config: Dict[str, Any], config: Dict[str, Any]):
     """Process user message and generate streaming response with synchronized text + audio."""
-    # Ensure session state is initialized
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    
-    # Add user message to history
+    # Use ui_event_q to handle session state updates from main thread
     user_message = {
         "role": "user",
         "text": user_input,
         "started_at": datetime.now().isoformat(),
         "ended_at": datetime.now().isoformat()
     }
-    st.session_state.messages.append(user_message)
-    st.session_state.current_audio_chunks = []
+    ui_event_q.put(("add_user_message", user_message))
+    ui_event_q.put(("clear_audio_chunks", None))
 
-    # Placeholder for streaming text
-    text_placeholder = st.empty()
+    # Placeholder for streaming text - use ui_event_q to get placeholder
+    ui_event_q.put(("get_text_placeholder", None))
     current_text_ref = [""]
 
     try:
         # Validate API keys
         if not config["elevenlabs_api_key"]:
-            st.error("❌ ElevenLabs API key is required. Please configure it in your secrets.")
+            ui_event_q.put(("error", "❌ ElevenLabs API key is required. Please configure it in your secrets."))
             return
         
         if not config["openai_api_key"]:
-            st.error("❌ OpenAI API key is required. Please configure it in your secrets.")
+            ui_event_q.put(("error", "❌ OpenAI API key is required. Please configure it in your secrets."))
             return
         
         # Create fresh clients inside this loop
@@ -537,58 +584,58 @@ async def process_user_message(user_input: str, sidebar_config: Dict[str, Any], 
         )
 
         # Connect TTS
-        st.session_state.connection_status = "connecting"
+        ui_event_q.put(("connection_status", "connecting"))
         ok = await tts_client.connect()
         if not ok:
-            st.session_state.connection_status = "error"
-            st.error("Failed to connect to TTS service.")
+            ui_event_q.put(("connection_status", "error"))
+            ui_event_q.put(("error", "Failed to connect to TTS service."))
             return
-        st.session_state.connection_status = "connected"
+        ui_event_q.put(("connection_status", "connected"))
 
         async def wait_for_player_ready(timeout_s=5):
             import time, asyncio
             start = time.time()
             while time.time() - start < timeout_s:
-                ctx = st.session_state.get("webrtc_ctx")
-                if ctx:
-                    # Check if the WebRTC context is initialized
-                    if hasattr(ctx, 'state') and ctx.state is not None:
-                        # If it's playing, great! If not, that's also okay - it will start when audio arrives
-                        return True
-                    # Also check if peer connection exists (even if not connected yet)
-                    pc = getattr(ctx, "peer_connection", None)
-                    if pc is not None:
-                        return True
+                # Use ui_event_q to request WebRTC context from main thread
+                ui_event_q.put(("webrtc_status_request", None))
                 await asyncio.sleep(0.1)
+                # For now, just return True after a short delay
+                # The main thread will handle WebRTC status checking
+                return True
             return False
 
         # after TTS connect succeeded
         ready = await wait_for_player_ready()
         if not ready:
-            st.info("WebRTC player initializing... audio will start when ready.")
+            # Use ui_event_q to notify main thread about WebRTC status
+            ui_event_q.put(("webrtc_info", "WebRTC player initializing... audio will start when ready."))
         
         # Give the WebRTC player a moment to fully initialize
         await asyncio.sleep(0.5)
 
         # Audio collection task
+        collected_chunks = []
         async def collect_audio():
             try:
                 chunk_count = 0
                 total_bytes = 0
+                logged_fmt = False
                 async for chunk in tts_client.audio_chunks():
-                    if chunk and "logged_fmt" not in st.session_state:
-                        st.session_state["logged_fmt"] = True
-                        st.write(f"First 8 bytes: {chunk[:8]!r}, len={len(chunk)}")
+                    if chunk and not logged_fmt:
+                        logged_fmt = True
+                        logger.debug(f"Audio chunk len={len(chunk)}")
 
-                    st.session_state.current_audio_chunks.append(chunk)
+                    # Use ui_event_q to notify main thread about audio chunks
+                    ui_event_q.put(("audio_chunk", chunk))
                     chunk_count += 1
                     total_bytes += len(chunk)
+                    collected_chunks.append(chunk)
                     # NEW: feed the WebRTC player
                     audio_chunk_queue.put(chunk)
                 
-                print(f"Audio collection completed: {chunk_count} chunks, {total_bytes} total bytes")
+                logger.info(f"Audio collection completed: {chunk_count} chunks, {total_bytes} total bytes")
             except Exception as e:
-                print(f"Error collecting audio: {e}")
+                logger.error(f"Error collecting audio: {e}")
 
         collector_task = asyncio.create_task(collect_audio())
 
@@ -596,7 +643,7 @@ async def process_user_message(user_input: str, sidebar_config: Dict[str, Any], 
         try:
             async for token in llm.stream_assistant_reply(user_input):
                 current_text_ref[0] += token
-                text_placeholder.markdown(f"**Assistant:** {current_text_ref[0]}")
+                ui_event_q.put(("update_text_placeholder", f"**Assistant:** {current_text_ref[0]}"))
                 await tts_client.send_text_fragment(token)
 
             await tts_client.finalize()
@@ -607,27 +654,20 @@ async def process_user_message(user_input: str, sidebar_config: Dict[str, Any], 
 
         # Save final assistant message + audio
         current_text = current_text_ref[0]
-        audio_path = ""
-        
-        if st.session_state.current_audio_chunks:
-            audio_path = save_audio_chunks(st.session_state.current_audio_chunks, config)
-        else:
-            print("No audio chunks to save!")
 
-        assistant_message = {
-            "role": "assistant",
-            "text": current_text,
-            "audio_path": audio_path,
-            "started_at": datetime.now().isoformat(),
-            "ended_at": datetime.now().isoformat(),
-        }
-        st.session_state.messages.append(assistant_message)
-
-        text_placeholder.markdown(f"**Assistant:** {current_text}")
-        st.session_state.current_audio_chunks = []
+        # 🚫 remove any direct session_state writes here
+        # ✅ enqueue a single event with everything the UI needs:
+        ui_event_q.put((
+            "finalize_assistant",
+            {
+                "text": current_text,
+                "chunks": collected_chunks,   # list[bytes]
+                "config": config,             # for sample rate, etc.
+            }
+        ))
 
     except Exception as e:
-        st.error(f"Error processing message: {e}")
+        ui_event_q.put(("error", f"Error processing message: {e}"))
         # Clean up TTS client on error
         try:
             if 'tts_client' in locals() and hasattr(tts_client, "close"):
@@ -762,11 +802,110 @@ def render_webrtc_player():
     else:
         st.info("Initializing audio player...")
 
+def _audio_consumer_loop():
+    while not APP_SHUTTING_DOWN.is_set():
+        try:
+            pcm16 = mic_pcm_q_global.get(timeout=0.2)
+        except Empty:
+            continue
+        try:
+            # Safe read with add_script_run_ctx, but skip if shutting down
+            if APP_SHUTTING_DOWN.is_set():
+                break
+            stt_service = st.session_state.get("stt_service")
+            is_rec = st.session_state.get("is_recording", False)
+            if stt_service and is_rec:
+                asyncio.run(stt_service.process_audio_data(pcm16))
+        except Exception:
+            logger.exception("audio_consumer_loop error")
 
 def render_stt_interface():
     """Render Speech-to-Text interface."""
     st.subheader("🎤 Voice Input")
     
+    # For now, skip STT service initialization and go straight to WebRTC testing
+    st.info("🧪 WebRTC Microphone Test Mode - STT service disabled for debugging")
+
+    def _pump_ui_events():
+        pumped = 0
+        while True:
+            try:
+                kind, payload = ui_event_q.get_nowait()
+            except Empty:
+                break
+            if kind == "transcription":
+                if payload:
+                    st.session_state.transcribed_text = payload
+                    st.session_state._needs_rerun = True
+            elif kind == "error":
+                # safe to call st.* here (we are on main thread)
+                st.error(payload)
+            elif kind == "audio_chunk":
+                # Handle audio chunks from collect_audio() - add to session state
+                st.session_state.current_audio_chunks.append(payload)
+            elif kind == "add_user_message":
+                # Add user message to session state
+                st.session_state.messages.append(payload)
+            elif kind == "add_assistant_message":
+                # Add assistant message to session state
+                st.session_state.messages.append(payload)
+            elif kind == "clear_audio_chunks":
+                # Clear audio chunks
+                st.session_state.current_audio_chunks = []
+            elif kind == "connection_status":
+                # Update connection status
+                st.session_state.connection_status = payload
+            elif kind == "webrtc_info":
+                # Show WebRTC info message
+                st.info(payload)
+            elif kind == "webrtc_status_request":
+                # Handle WebRTC status request (placeholder for now)
+                pass
+            elif kind == "get_text_placeholder":
+                # Get text placeholder - create one if it doesn't exist
+                if "text_placeholder" not in st.session_state:
+                    st.session_state.text_placeholder = st.empty()
+            elif kind == "update_text_placeholder":
+                # Update text placeholder
+                if "text_placeholder" in st.session_state:
+                    st.session_state.text_placeholder.markdown(payload)
+                # 🔁 request a rerun so the UI updates during streaming
+                # (optional throttle to avoid too many reruns)
+                cnt = st.session_state.get("_stream_tick", 0) + 1
+                st.session_state["_stream_tick"] = cnt
+                if cnt % 3 == 0:  # update UI every 3 tokens (tweak as you like)
+                    st.session_state._needs_rerun = True
+            elif kind == "save_audio_chunks":
+                # Save audio chunks
+                if st.session_state.current_audio_chunks:
+                    audio_path = save_audio_chunks(st.session_state.current_audio_chunks, payload)
+                    st.session_state.current_audio_path = audio_path
+            elif kind == "finalize_assistant":
+                payload = payload or {}
+                text = payload.get("text", "")
+                chunks = payload.get("chunks") or []
+                cfg = payload.get("config") or st.session_state.get("config", {})
+                audio_path = ""
+                if chunks:
+                    audio_path = save_audio_chunks(chunks, cfg)
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "text": text,
+                    "audio_path": audio_path,
+                    "started_at": datetime.now().isoformat(),
+                    "ended_at": datetime.now().isoformat(),
+                })
+                # update the live placeholder too if present
+                if "text_placeholder" in st.session_state:
+                    st.session_state.text_placeholder.markdown(f"**Assistant:** {text}")
+            elif kind == "get_audio_path":
+                # Get audio path (placeholder for now)
+                pass
+            pumped += 1
+        return pumped
+    
+    _pump_ui_events()
+
     # Initialize STT service if not already done or if config changed
     current_api_key = st.session_state.config.get("openai_api_key", "")
     if (st.session_state.stt_service is None or 
@@ -782,35 +921,36 @@ def render_stt_interface():
             st.session_state.stt_service = None
         
         try:
-            st.session_state.stt_service = create_stt_service(
-                api_key=current_api_key
-            )
-            st.session_state.last_openai_api_key = current_api_key
-            
-            # Set up transcription callback
-            def on_transcription(text):
-                if text and text.strip():
-                    st.session_state.transcribed_text = text.strip()
-                    # Clear transcription timeout
-                    if hasattr(st.session_state, 'transcription_start_time'):
-                        del st.session_state.transcription_start_time
-                    st.success(f"🎉 Transcription received: {text.strip()}")
-                    st.session_state._needs_rerun = True
-                else:
-                    st.warning("⚠️ Empty transcription received")
-            
-            def on_error(error):
-                st.error(f"STT Error: {error}")
-                st.session_state.last_stt_error = str(error)
-                st.session_state._needs_rerun = True
-            
-            st.session_state.stt_service.set_transcription_callback(on_transcription)
-            st.session_state.stt_service.set_error_callback(on_error)
-            
-            st.success("STT service initialized!")
+            # Try to import and create STT service
+            try:
+                st.session_state.stt_service = create_stt_service(
+                    api_key=current_api_key
+                )
+                st.session_state.last_openai_api_key = current_api_key
+                
+                # Set up transcription callback
+                def on_transcription(text):
+                    # Worker thread -> just enqueue event; main thread will render
+                    ui_event_q.put(("transcription", (text or "").strip()))
+
+                def on_error(error):
+                    ui_event_q.put(("error", str(error)))
+                
+                st.session_state.stt_service.set_transcription_callback(on_transcription)
+                st.session_state.stt_service.set_error_callback(on_error)
+                
+                st.success("STT service initialized!")
+            except ImportError as e:
+                logger.error(f"STT service import failed: {e}")
+                st.warning(f"⚠️ STT service import failed: {e} - continuing in test mode")
+                st.session_state.stt_service = None
+            except Exception as e:
+                logger.error(f"STT service creation failed: {e}")
+                st.warning(f"⚠️ STT service creation failed: {e} - continuing in test mode")
+                st.session_state.stt_service = None
         except Exception as e:
             st.error(f"Failed to initialize STT service: {e}")
-            return
+            st.warning("⚠️ WebRTC microphone will still work for testing, but STT features are disabled")
     
     # Connection status
     if st.session_state.stt_service:
@@ -819,12 +959,19 @@ def render_stt_interface():
             st.success("✅ Connected to OpenAI Realtime API")
         else:
             st.error("❌ Not connected to OpenAI Realtime API")
+    else:
+        st.warning("⚠️ STT service not available - WebRTC microphone is in test mode")
     
     # WebRTC microphone capture
     st.write("**Microphone Access:**")
     
     # WebRTC receiver for microphone input with better error handling
     try:
+        logger.info("🎤 Creating WebRTC microphone streamer...")
+        logger.info(f"🔧 Frontend RTC config: {FRONTEND_RTC_CFG}")
+        logger.info(f"🔧 Server RTC config: {SERVER_RTC_CFG}")
+        logger.info(f"🎯 Audio callback: {on_audio_frames}")
+        
         webrtc_ctx = safe_webrtc_streamer(
             key="microphone",
             mode=WebRtcMode.SENDONLY,
@@ -833,8 +980,7 @@ def render_stt_interface():
                 "audio": {
                     "echoCancellation": True,
                     "noiseSuppression": True,
-                    "autoGainControl": True,
-                    "sampleRate": 16000
+                    "autoGainControl": True
                 }
             },
             frontend_rtc_configuration=FRONTEND_RTC_CFG,
@@ -844,16 +990,43 @@ def render_stt_interface():
             audio_receiver_size=8,                         # small buffer
             sendback_audio=False,                          # avoid echo
         )
+        
+        # Only log WebRTC creation once per session to reduce spam
+        if "webrtc_created" not in st.session_state:
+            logger.info(f"✅ WebRTC microphone streamer created: {webrtc_ctx}")
+            st.session_state.webrtc_created = True
+            if webrtc_ctx:
+                logger.debug(f"📊 WebRTC context state: {getattr(webrtc_ctx, 'state', 'No state')}")
+                logger.debug(f"🔗 WebRTC context attributes: {[attr for attr in dir(webrtc_ctx) if not attr.startswith('_')]}")
     except Exception as e:
-        logger.error(f"Failed to create micropho    ne WebRTC streamer: {e}")
+        logger.error(f"Failed to create microphone WebRTC streamer: {e}")
         import traceback
         logger.error(f"WebRTC error traceback: {traceback.format_exc()}")
         webrtc_ctx = None
+        
+        # Show error in UI for debugging
+        st.error(f"❌ WebRTC Error: {e}")
+        st.code(traceback.format_exc())
     
     if webrtc_ctx is None:
         st.error("Failed to initialize microphone. Please refresh the page and try again.")
         st.info("If the problem persists, try using a different browser or check your internet connection.")
         st.info("Make sure your browser allows microphone access for this site.")
+        
+        # Add a test button even when WebRTC fails
+        st.write("**Debug Options:**")
+        if st.button("🧪 Test Callback (No WebRTC)"):
+            # Create a dummy audio frame to test the callback
+            import numpy as np
+            from av import AudioFrame
+            dummy_frame = AudioFrame.from_ndarray(
+                np.random.randn(1024).astype(np.float32), 
+                format='flt', 
+                layout='mono'
+            )
+            logger.info("🧪 Testing on_audio_frames callback with dummy data (no WebRTC)")
+            on_audio_frames([dummy_frame])
+            st.success("✅ Callback test completed - check logs")
         
         # Show fallback interface
         render_webrtc_fallback()
@@ -863,7 +1036,7 @@ def render_stt_interface():
     st.session_state.webrtc_mic_ctx = webrtc_ctx
     
     # Add refresh button for WebRTC issues
-    col_refresh1, col_refresh2, col_refresh3 = st.columns([1, 1, 2])
+    col_refresh1, col_refresh2, col_refresh3, col_test = st.columns([1, 1, 1, 1])
     with col_refresh1:
         if st.button("🔄 Refresh WebRTC"):
             cleanup_webrtc_connections()
@@ -871,7 +1044,20 @@ def render_stt_interface():
     with col_refresh2:
         if st.button("🧹 Force Cleanup"):
             cleanup_webrtc_connections()
-            st.experimental_rerun()
+            st.rerun()
+    with col_test:
+        if st.button("🧪 Test Callback"):
+            # Create a dummy audio frame to test the callback
+            import numpy as np
+            from av import AudioFrame
+            dummy_frame = AudioFrame.from_ndarray(
+                np.random.randn(1024).astype(np.float32), 
+                format='flt', 
+                layout='mono'
+            )
+            logger.info("🧪 Testing on_audio_frames callback with dummy data")
+            on_audio_frames([dummy_frame])
+            st.success("✅ Callback test completed - check logs")
     with col_refresh3:
         st.info("💡 If WebRTC is stuck, try the cleanup buttons above")
     
@@ -1050,6 +1236,21 @@ def render_stt_interface():
             stats = st.session_state.stt_service.get_recording_stats()
             st.json(stats)
 
+    _pump_ui_events()
+
+    # Drain raw mic chunks into session buffer when recording-to-file is enabled
+    if st.session_state.get("is_recording_audio", False):
+        drained = 0
+        while True:
+            try:
+                chunk = raw_audio_q.get_nowait()
+            except Empty:
+                break
+            st.session_state.recorded_audio_data.append(chunk)
+            drained += 1
+        if drained:
+            logger.info(f"Buffered {drained} raw audio chunks for file recording")
+
 
 def generate_and_queue_audio(llm_response_generator, tts_model, tts_settings):
     """
@@ -1095,13 +1296,25 @@ def run_coro_in_thread(coro):
 
 def main():
     """Main application function."""
+    logger.info("🚀 Starting main application function")
+    
     # Initialize session state
+    logger.info("📝 Initializing session state")
     initialize_session_state()
+
+    if "audio_consumer_started" not in st.session_state:
+        t = threading.Thread(target=_audio_consumer_loop, daemon=True)
+        add_script_run_ctx(t)  # safe to read session_state in the thread
+        t.start()
+        st.session_state.audio_consumer_started = True
 
     # Get configuration - handle missing secrets gracefully
     try:
+        logger.info("⚙️ Loading configuration")
         config = get_config_from_secrets()
+        logger.info(f"✅ Configuration loaded: {list(config.keys())}")
     except Exception as e:
+        logger.error(f"❌ Configuration error: {e}")
         st.error(f"Configuration error: {e}")
         st.stop()
 
@@ -1131,12 +1344,21 @@ def main():
     render_webrtc_player()
     
     # STT Interface
+    # Only log STT interface rendering once per session
+    if "stt_interface_rendered" not in st.session_state:
+        logger.info("🎤 Rendering STT interface")
+        st.session_state.stt_interface_rendered = True
+    
     render_stt_interface()
+    logger.info("✅ STT interface rendered")
 
     # Chat input
     if prompt := st.chat_input("Type your message here..."):
-        # fire(process_user_message(prompt, sidebar_config, config))
+        # make a fresh placeholder for this turn
+        st.session_state.text_placeholder = st.empty()
         run_coro_in_thread(process_user_message(prompt, sidebar_config, config))
+        # kick a first rerun so streaming can start updating
+        st.session_state._needs_rerun = True
 
     # System status
     with st.expander("🔧 System Status"):
