@@ -4,10 +4,14 @@ Streamlit Chatbot with Realtime TTS using ElevenLabs.
 import streamlit as st
 import asyncio
 import os
+import logging
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from queue import Queue, Empty
 from fractions import Fraction
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 # Import our modules
 from llm.streaming_llm import create_streaming_llm
@@ -15,6 +19,8 @@ from realtime.tts_elevenlabs_ws import create_tts_client
 from realtime.audio_sender import get_track, AudioQueueManager
 from utils.audio import write_wav
 from utils.zipper import build_conversation_zip
+from stt.stt_service import create_stt_service
+from stt.audio_receiver import AudioReceiverTrack
 
 # WebRTC imports
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
@@ -31,7 +37,7 @@ audio_chunk_queue = Queue()
 
 # Page configuration
 st.set_page_config(
-    page_title="Realtime TTS Chatbot",
+    page_title="Realtime TTS",
     page_icon="🎤",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -79,6 +85,18 @@ def initialize_session_state():
     
     if "current_conversation_id" not in st.session_state:
         st.session_state.current_conversation_id = None
+    
+    # STT related state
+    if "stt_service" not in st.session_state:
+        st.session_state.stt_service = None
+    
+    if "is_recording" not in st.session_state:
+        st.session_state.is_recording = False
+    
+    if "transcribed_text" not in st.session_state:
+        st.session_state.transcribed_text = ""
+    if "transcription_timeout" not in st.session_state:
+        st.session_state.transcription_timeout = False
 
 
 def get_config_from_secrets():
@@ -87,8 +105,7 @@ def get_config_from_secrets():
         "elevenlabs_api_key": st.secrets.get("ELEVENLABS_API_KEY", os.getenv("ELEVENLABS_API_KEY", "")),
         "elevenlabs_voice_id": st.secrets.get("ELEVENLABS_VOICE_ID", os.getenv("ELEVENLABS_VOICE_ID", "default_voice")),
         "openai_api_key": st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")),
-        "use_dummy_llm": str(st.secrets.get("USE_DUMMY_LLM", os.getenv("USE_DUMMY_LLM", "true"))).lower() == "true",
-        "use_dummy_tts": str(st.secrets.get("USE_DUMMY_TTS", os.getenv("USE_DUMMY_TTS", "true"))).lower() == "true",
+
         "available_voices": st.secrets.get("AVAILABLE_VOICES", "default_voice").split(","),
         "tts_sample_rate": int(st.secrets.get("TTS_SAMPLE_RATE", "16000")),
         "tts_chunk_size_ms": int(st.secrets.get("TTS_CHUNK_SIZE_MS", "20"))
@@ -98,7 +115,7 @@ def get_config_from_secrets():
 
 def render_header():
     """Render the main header with status."""
-    st.markdown('<h1 class="main-header">🎤 Realtime TTS Chatbot</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🎤 Realtime TTS Tool</h1>', unsafe_allow_html=True)
     
     # Status badge
     status_class = {
@@ -130,9 +147,7 @@ def render_sidebar(config: Dict[str, Any]):
         key="voice_selectbox"
     )
     
-    # Feature toggles
-    use_dummy_llm = st.sidebar.checkbox("Use Dummy LLM", value=config["use_dummy_llm"])
-    use_dummy_tts = st.sidebar.checkbox("Use Dummy TTS", value=config["use_dummy_tts"])
+
     
     # Save conversation button
     if st.sidebar.button("💾 Save Conversation", type="primary"):
@@ -148,9 +163,7 @@ def render_sidebar(config: Dict[str, Any]):
     st.sidebar.markdown(f"Chunk Size: {config['tts_chunk_size_ms']} ms")
     
     return {
-        "selected_voice": selected_voice,
-        "use_dummy_llm": use_dummy_llm,
-        "use_dummy_tts": use_dummy_tts
+        "selected_voice": selected_voice
     }
 
 
@@ -188,15 +201,22 @@ async def process_user_message(user_input: str, sidebar_config: Dict[str, Any], 
     current_text_ref = [""]
 
     try:
+        # Validate API keys
+        if not config["elevenlabs_api_key"]:
+            st.error("❌ ElevenLabs API key is required. Please configure it in your secrets.")
+            return
+        
+        if not config["openai_api_key"]:
+            st.error("❌ OpenAI API key is required. Please configure it in your secrets.")
+            return
+        
         # Create fresh clients inside this loop
         tts_client = create_tts_client(
             voice_id=sidebar_config["selected_voice"],
             api_key=config["elevenlabs_api_key"],
-            use_dummy=sidebar_config["use_dummy_tts"],
             sample_rate=config["tts_sample_rate"],
         )
         llm = create_streaming_llm(
-            use_dummy=sidebar_config["use_dummy_llm"],
             openai_api_key=config["openai_api_key"],
         )
 
@@ -417,6 +437,216 @@ def render_webrtc_player():
         st.info("Initializing audio player...")
 
 
+def render_stt_interface():
+    """Render Speech-to-Text interface."""
+    st.subheader("🎤 Voice Input")
+    
+    # Initialize STT service if not already done
+    if st.session_state.stt_service is None:
+        try:
+            st.session_state.stt_service = create_stt_service(
+                api_key=st.session_state.config["openai_api_key"]
+            )
+            
+            # Set up transcription callback
+            def on_transcription(text):
+                if text and text.strip():
+                    st.session_state.transcribed_text = text.strip()
+                    # Clear transcription timeout
+                    if hasattr(st.session_state, 'transcription_start_time'):
+                        del st.session_state.transcription_start_time
+                    st.success(f"🎉 Transcription received: {text.strip()}")
+                    st.rerun()
+                else:
+                    st.warning("⚠️ Empty transcription received")
+            
+            def on_error(error):
+                st.error(f"STT Error: {error}")
+            
+            st.session_state.stt_service.set_transcription_callback(on_transcription)
+            st.session_state.stt_service.set_error_callback(on_error)
+            
+            st.success("STT service initialized!")
+        except Exception as e:
+            st.error(f"Failed to initialize STT service: {e}")
+            return
+    
+    # Connection status
+    if st.session_state.stt_service:
+        stats = st.session_state.stt_service.get_recording_stats()
+        if stats["is_connected"]:
+            st.success("✅ Connected to OpenAI Realtime API")
+        else:
+            st.error("❌ Not connected to OpenAI Realtime API")
+    
+    # WebRTC microphone capture
+    st.write("**Microphone Access:**")
+    
+    def audio_frame_callback(frame):
+        """Callback for processing audio frames from microphone."""
+        if st.session_state.stt_service and st.session_state.is_recording:
+            # Convert frame to bytes and process
+            audio_data = frame.to_ndarray()
+            if len(audio_data.shape) > 1:
+                audio_data = audio_data.mean(axis=0)  # Convert to mono
+            audio_bytes = (audio_data * 32767).astype('int16').tobytes()
+            
+            # Debug: Log audio frame info
+            logger.info(f"Processing audio frame: {len(audio_bytes)} bytes, shape: {audio_data.shape}")
+            
+            # Process audio data asynchronously
+            import asyncio
+            try:
+                asyncio.run(st.session_state.stt_service.process_audio_data(audio_bytes))
+            except Exception as e:
+                logger.error(f"Error processing audio: {e}")
+                st.error(f"Error processing audio: {e}")
+    
+    # WebRTC receiver for microphone input
+    webrtc_ctx = webrtc_streamer(
+        key="microphone",
+        mode=WebRtcMode.RECVONLY,
+        media_stream_constraints={"video": False, "audio": True},
+        frontend_rtc_configuration=RTC_CFG,
+        server_rtc_configuration=RTC_CFG,
+        async_processing=True,
+    )
+    
+    # Debug: Show WebRTC status
+    if webrtc_ctx.audio_receiver:
+        st.success("✅ Microphone access granted")
+        webrtc_ctx.audio_receiver.add_track(audio_frame_callback)
+    else:
+        st.warning("⚠️ Microphone access not available - please allow microphone access in your browser")
+    
+    # Connection controls
+    if st.session_state.stt_service:
+        stats = st.session_state.stt_service.get_recording_stats()
+        col_conn1, col_conn2 = st.columns([1, 1])
+        
+        with col_conn1:
+            if not stats["is_connected"]:
+                if st.button("🔌 Connect to OpenAI"):
+                    with st.spinner("Connecting..."):
+                        import asyncio
+                        try:
+                            asyncio.run(st.session_state.stt_service.connect())
+                            st.success("Connected successfully!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Connection failed: {e}")
+        
+        with col_conn2:
+            if stats["is_connected"]:
+                if st.button("🔌 Disconnect"):
+                    with st.spinner("Disconnecting..."):
+                        import asyncio
+                        try:
+                            asyncio.run(st.session_state.stt_service.disconnect())
+                            st.success("Disconnected successfully!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Disconnection failed: {e}")
+    
+    # Recording controls
+    col1, col2, col3 = st.columns([1, 1, 2])
+    
+    with col1:
+        stats = st.session_state.stt_service.get_recording_stats() if st.session_state.stt_service else {"is_connected": False}
+        if st.button("🎤 Start Recording", disabled=st.session_state.is_recording or not stats["is_connected"]):
+            logger.info("Start recording button clicked")
+            st.session_state.stt_service.start_recording()
+            st.session_state.is_recording = True
+            st.info("🎤 Recording started - speak now!")
+            st.rerun()
+    
+    with col2:
+        if st.button("⏹️ Stop Recording", disabled=not st.session_state.is_recording):
+            logger.info("Stop recording button clicked")
+            st.session_state.stt_service.stop_recording()
+            st.session_state.is_recording = False
+            st.session_state.transcription_timeout = False
+            
+            # Show audio buffer size for debugging
+            stats = st.session_state.stt_service.get_recording_stats()
+            st.info(f"📊 Audio buffer size: {stats.get('recorded_audio_size', 0)} bytes")
+            
+            # Transcribe the recorded audio
+            with st.spinner("🔄 Processing audio..."):
+                import asyncio
+                result = asyncio.run(st.session_state.stt_service.commit_audio_for_transcription())
+                if result["success"]:
+                    st.info("🎯 Audio sent for transcription - waiting for results...")
+                    # Set a timeout flag to show manual option if transcription doesn't come back
+                    import time
+                    st.session_state.transcription_start_time = time.time()
+                else:
+                    st.error(f"❌ Transcription failed: {result.get('error', 'Unknown error')}")
+            st.rerun()
+    
+    with col3:
+        if st.session_state.is_recording:
+            st.error("🔴 Recording...")
+        else:
+            st.info("⏸️ Ready to record")
+    
+    # Display transcribed text and transcription status
+    if st.session_state.transcribed_text:
+        st.success("✅ Transcription Complete!")
+        st.text_area("Transcribed Text:", value=st.session_state.transcribed_text, height=100)
+        
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("📤 Send as Message"):
+                # Send the transcribed text as a message
+                if st.session_state.transcribed_text.strip():
+                    run_coro_in_thread(process_user_message(
+                        st.session_state.transcribed_text.strip(), 
+                        st.session_state.get("sidebar_config", {}), 
+                        st.session_state.get("config", {})
+                    ))
+                    st.session_state.transcribed_text = ""  # Clear after sending
+                    st.rerun()
+        
+        with col2:
+            if st.button("🗑️ Clear"):
+                st.session_state.transcribed_text = ""
+                st.rerun()
+    else:
+        # Show transcription status when no text yet
+        if st.session_state.is_recording:
+            st.info("🎤 Recording... Speak now!")
+        elif hasattr(st.session_state, 'stt_service') and st.session_state.stt_service.is_connected:
+            # Check for transcription timeout
+            if hasattr(st.session_state, 'transcription_start_time'):
+                import time
+                elapsed = time.time() - st.session_state.transcription_start_time
+                if elapsed > 10:  # 10 second timeout
+                    st.warning("⏰ Transcription taking longer than expected...")
+                    if st.button("🔄 Retry Transcription"):
+                        # Clear timeout and retry
+                        del st.session_state.transcription_start_time
+                        st.rerun()
+                else:
+                    st.info("🎯 Ready to record - click 'Start Recording' to begin")
+            else:
+                st.info("🎯 Ready to record - click 'Start Recording' to begin")
+            
+            # Debug: Add manual transcription test button
+            if st.button("🧪 Test Transcription (Debug)"):
+                # Simulate a transcription for testing
+                st.session_state.transcribed_text = "This is a test transcription"
+                if hasattr(st.session_state, 'transcription_start_time'):
+                    del st.session_state.transcription_start_time
+                st.rerun()
+    
+    # STT stats
+    if st.session_state.stt_service:
+        with st.expander("📊 STT Statistics"):
+            stats = st.session_state.stt_service.get_recording_stats()
+            st.json(stats)
+
+
 def generate_and_queue_audio(llm_response_generator, tts_model, tts_settings):
     """
     Generates audio from the LLM response stream and puts it into a queue.
@@ -479,6 +709,10 @@ def main():
 
     # Render sidebar
     sidebar_config = render_sidebar(config)
+    
+    # Store config in session state for STT interface
+    st.session_state.config = config
+    st.session_state.sidebar_config = sidebar_config
 
     # Render chat history
     render_chat_history()
@@ -487,6 +721,9 @@ def main():
 
     # WebRTC audio player
     render_webrtc_player()
+    
+    # STT Interface
+    render_stt_interface()
 
     # Chat input
     if prompt := st.chat_input("Type your message here..."):

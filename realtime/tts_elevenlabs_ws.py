@@ -518,86 +518,39 @@ class ElevenLabsRealtimeClient:
         self.connected = False
 
 
-class DummyTTSClient:
-    """Dummy TTS client for testing without ElevenLabs credentials."""
-    
-    def __init__(self, voice_id: str = "dummy", api_key: str = "dummy", sample_rate: int = 16000):
-        self.voice_id = voice_id
-        self.api_key = api_key
-        self.sample_rate = sample_rate
-        self.connected = True
-        
-    async def connect(self) -> bool:
-        """Simulate connection."""
-        return True
-    
-    async def send_text_fragment(self, text: str) -> None:
-        """Simulate sending text (no-op)."""
-        pass
-    
-    async def audio_chunks(self) -> AsyncGenerator[bytes, None]:
-        """
-        Generate dummy audio chunks.
-        
-        Yields:
-            PCM16 audio bytes (sine wave)
-        """
-        # Generate a simple sine wave for testing
-        frequency = 440  # A4 note
-        duration_ms = 20  # 20ms chunks
-        samples_per_chunk = int(self.sample_rate * duration_ms / 1000)
-        
-        chunk_count = 0
-        while chunk_count < 50:  # Generate ~1 second of audio
-            # Generate sine wave samples
-            t = np.linspace(0, duration_ms/1000, samples_per_chunk, False)
-            audio_samples = np.sin(2 * np.pi * frequency * t)
-            
-            # Convert to PCM16
-            pcm16_samples = (audio_samples * 32767).astype(np.int16)
-            audio_bytes = pcm16_samples.tobytes()
-            
-            yield audio_bytes
-            
-            chunk_count += 1
-            await asyncio.sleep(duration_ms / 1000)  # Simulate real-time
-    
-    async def finalize(self) -> None:
-        """Simulate finalization."""
-        pass
-    
-    async def close(self) -> None:
-        """Simulate closing."""
-        pass
-
 
 def create_tts_client(
     voice_id: str, 
     api_key: str, 
-    use_dummy: bool = True,
     sample_rate: int = 16000
-) -> ElevenLabsRealtimeClient | DummyTTSClient:
+) -> ElevenLabsRealtimeClient:
     """
     Create a TTS client.
     
     Args:
         voice_id: ElevenLabs voice ID
         api_key: ElevenLabs API key
-        use_dummy: Whether to use dummy TTS for testing
         sample_rate: Target audio sample rate
         
     Returns:
         TTS client instance
     """
-    if use_dummy:
-        return DummyTTSClient(voice_id=voice_id, api_key=api_key, sample_rate=sample_rate)
-    else:
-        return ElevenLabsRealtimeClient(voice_id=voice_id, api_key=api_key, sample_rate=sample_rate)
+    if not api_key:
+        raise ValueError("ElevenLabs API key is required")
+    return ElevenLabsRealtimeClient(voice_id=voice_id, api_key=api_key, sample_rate=sample_rate)
 
 
 async def test_tts_client():
     """Test function for TTS client."""
-    client = DummyTTSClient()
+    import os
+    api_key = os.getenv("ELEVENLABS_API_KEY")
+    voice_id = os.getenv("ELEVENLABS_VOICE_ID", "pNInz6obpgDQGcFmaJgB")  # Default voice
+    
+    if not api_key:
+        print("Please set ELEVENLABS_API_KEY environment variable")
+        return
+    
+    client = create_tts_client(voice_id=voice_id, api_key=api_key)
     
     if await client.connect():
         print("Connected to TTS service")

@@ -1,14 +1,15 @@
-# 🎤 Streamlit Realtime TTS Chatbot
+# 🎤 Streamlit Realtime TTS & STT Chatbot
 
-A production-ready Streamlit chatbot with realtime Text-to-Speech using ElevenLabs, featuring WebRTC audio streaming and conversation management.
+A production-ready Streamlit chatbot with realtime Text-to-Speech and Speech-to-Text capabilities, featuring WebRTC audio streaming, OpenAI Realtime API transcription, and conversation management.
 
 ## ✨ Features
 
 - **Realtime TTS**: Stream audio as text is generated using ElevenLabs WebSocket API
-- **WebRTC Audio**: Low-latency audio streaming via browser WebRTC
-- **Streaming LLM**: Token-by-token text generation with OpenAI or dummy LLM
+- **Speech-to-Text**: Voice input with OpenAI Realtime API for accurate transcription
+- **WebRTC Audio**: Low-latency audio streaming and microphone capture via browser WebRTC
+- **Streaming LLM**: Token-by-token text generation with OpenAI
 - **Conversation Management**: Save conversations as ZIP files with transcripts and audio
-- **Modular Architecture**: Easy to switch between different TTS and LLM providers
+- **Modular Architecture**: Easy to switch between different TTS, STT, and LLM providers
 - **Production Ready**: Error handling, reconnection logic, and graceful cleanup
 
 ## 🏗️ Architecture
@@ -18,6 +19,9 @@ app.py (Main Streamlit App)
 ├── llm/streaming_llm.py (LLM Integration)
 ├── realtime/tts_elevenlabs_ws.py (TTS WebSocket Client)
 ├── realtime/audio_sender.py (WebRTC Audio Track)
+├── stt/openai_realtime_stt.py (Speech-to-Text with OpenAI Realtime API)
+├── stt/audio_receiver.py (WebRTC Microphone Capture)
+├── stt/stt_service.py (STT Service Integration)
 ├── utils/audio.py (Audio Processing)
 └── utils/zipper.py (Conversation Export)
 ```
@@ -29,6 +33,8 @@ app.py (Main Streamlit App)
 ```bash
 pip install -r requirements.txt
 ```
+
+**Note**: The app uses OpenAI's Realtime API for speech-to-text, which requires an OpenAI API key with access to the Realtime API.
 
 ### 2. Configure Secrets
 
@@ -45,12 +51,10 @@ Edit `.streamlit/secrets.toml`:
 ELEVENLABS_API_KEY = "sk-your-actual-api-key"
 ELEVENLABS_VOICE_ID = "your-voice-id"
 
-# OpenAI Configuration (optional)
+# OpenAI Configuration (required for STT)
 OPENAI_API_KEY = "sk-your-openai-key"
 
-# Feature Flags
-USE_DUMMY_LLM = true
-USE_DUMMY_TTS = true
+# Required API Keys
 ```
 
 ### 3. Run the Application
@@ -70,16 +74,23 @@ You can also set configuration via environment variables:
 ```bash
 export ELEVENLABS_API_KEY="sk-your-key"
 export ELEVENLABS_VOICE_ID="your-voice-id"
-export USE_DUMMY_LLM="true"
-export USE_DUMMY_TTS="true"
+
 ```
 
-### TTS Settings
+### Audio Settings
 
+#### TTS Settings
 - **Sample Rate**: 16,000 Hz (mono)
 - **Chunk Size**: 20ms frames
 - **Audio Format**: PCM16
 - **Buffer Strategy**: Time-based (150ms) + punctuation-triggered flush
+
+#### STT Settings
+- **Sample Rate**: 24,000 Hz (mono) - OpenAI Realtime API requirement
+- **Audio Format**: 16-bit PCM
+- **Model**: gpt-4o-realtime-preview-2024-10-01 (configurable)
+- **Transcription**: Real-time streaming via WebSocket
+- **Voice Activity Detection**: Server-side VAD with configurable thresholds
 
 ## 🎯 Usage
 
@@ -89,13 +100,34 @@ Click the "🔄 Initialize Services" button to connect to TTS and LLM services.
 
 ### 2. Start Chatting
 
+You can interact with the chatbot in two ways:
+
+#### Text Input
 Type your message in the chat input. The assistant will:
 - Generate streaming text response
 - Convert text to speech in real-time
 - Stream audio via WebRTC
 - Save audio files for each response
 
-### 3. Save Conversations
+#### Voice Input
+Use the speech-to-text feature:
+- Click "🎤 Start Recording" to begin voice capture
+- Speak your message into the microphone
+- Click "⏹️ Stop Recording" to end recording
+- Review the transcribed text
+- Click "📤 Send as Message" to send it to the chatbot
+
+### 3. Voice Conversation Workflow
+
+The app now supports complete voice conversations:
+
+1. **Speak to the Bot**: Use the microphone to record your message
+2. **Automatic Transcription**: Whisper converts your speech to text
+3. **LLM Processing**: The chatbot processes your transcribed message
+4. **Voice Response**: The bot responds with both text and synthesized speech
+5. **Continuous Conversation**: Repeat the cycle for natural voice interaction
+
+### 4. Save Conversations
 
 Click "💾 Save Conversation" in the sidebar to download a ZIP file containing:
 - `transcript.json` with timestamps and message history
@@ -112,10 +144,16 @@ Click "💾 Save Conversation" in the sidebar to download a ZIP file containing:
 - Multiple voice options
 - Requires API key
 
-#### Dummy TTS (Testing)
-- Generates sine wave audio
-- No API key required
-- Simulates real-time behavior
+
+
+### STT Providers
+
+#### OpenAI Realtime API (Production)
+- Real-time speech recognition with low latency
+- High-accuracy transcription using Whisper-1 model
+- Supports multiple languages
+- Requires OpenAI API key with Realtime API access
+- WebSocket-based streaming for real-time processing
 
 ### LLM Providers
 
@@ -124,10 +162,7 @@ Click "💾 Save Conversation" in the sidebar to download a ZIP file containing:
 - Real conversation capabilities
 - Requires API key
 
-#### Dummy LLM (Testing)
-- Generates canned responses
-- Simulates streaming behavior
-- No API key required
+
 
 ## 🌐 WebRTC Configuration
 
@@ -152,6 +187,14 @@ For cloud deployment, ensure your proxy allows:
 2. **WebRTC Issues**: Try refreshing the page
 3. **STUN/TURN**: Check if your network blocks UDP traffic
 4. **Browser Compatibility**: Test with Chrome/Edge (best WebRTC support)
+
+### STT Issues
+
+1. **Microphone Access**: Ensure browser has microphone permissions
+2. **OpenAI API Key**: Verify you have access to the Realtime API
+3. **Audio Quality**: Speak clearly and reduce background noise
+4. **Connection**: Check WebSocket connection to OpenAI Realtime API
+5. **Sample Rate**: Ensure audio is properly resampled to 24kHz
 
 ### Connection Errors
 
@@ -182,6 +225,11 @@ tts/
 │   ├── __init__.py               # Realtime package
 │   ├── tts_elevenlabs_ws.py     # ElevenLabs TTS client
 │   └── audio_sender.py           # WebRTC audio streaming
+├── stt/
+│   ├── __init__.py               # STT package
+│   ├── openai_realtime_stt.py    # OpenAI Realtime STT client
+│   ├── audio_receiver.py         # WebRTC microphone capture
+│   └── stt_service.py            # STT service integration
 └── utils/
     ├── __init__.py               # Utils package
     ├── audio.py                  # Audio processing utilities
@@ -223,9 +271,9 @@ CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0
 
 Set production environment variables:
 ```bash
-USE_DUMMY_LLM=false
-USE_DUMMY_TTS=false
 ELEVENLABS_API_KEY=your-production-key
+ELEVENLABS_VOICE_ID=your-voice-id
+OPENAI_API_KEY=your-openai-key
 ```
 
 ## 🤝 Contributing
@@ -244,6 +292,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 - [Streamlit](https://streamlit.io/) for the web framework
 - [ElevenLabs](https://elevenlabs.io/) for TTS API
+- [OpenAI Realtime API](https://openai.com/index/introducing-the-realtime-api/) for speech recognition
 - [aiortc](https://github.com/aiortc/aiortc) for WebRTC implementation
 - [streamlit-webrtc](https://github.com/whitphx/streamlit-webrtc) for Streamlit WebRTC integration
 
@@ -257,4 +306,4 @@ For issues and questions:
 
 ---
 
-**Happy Chatting! 🎤✨**
+**Happy Voice Chatting! 🎤🎧✨**

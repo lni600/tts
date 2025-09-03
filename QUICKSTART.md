@@ -20,24 +20,16 @@ streamlit run app.py
 
 ## 🎯 What You'll Get
 
-- **Realtime TTS Chatbot** with ElevenLabs integration
+- **Realtime TTS Tool** with ElevenLabs integration
 - **WebRTC Audio Streaming** for low-latency audio
-- **Streaming LLM Responses** (OpenAI or dummy)
+- **Streaming LLM Responses** with OpenAI
 - **Conversation Export** as ZIP files with transcripts and audio
 - **Production-Ready Architecture** with error handling
 
 ## 🔧 Configuration Options
 
-### For Testing (No API Keys Required)
+### Required Configuration
 ```toml
-USE_DUMMY_LLM = true
-USE_DUMMY_TTS = true
-```
-
-### For Production
-```toml
-USE_DUMMY_LLM = false
-USE_DUMMY_TTS = false
 ELEVENLABS_API_KEY = "sk-your-key"
 ELEVENLABS_VOICE_ID = "your-voice-id"
 OPENAI_API_KEY = "sk-your-openai-key"

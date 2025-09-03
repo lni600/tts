@@ -24,42 +24,6 @@ class StreamingLLM:
         raise NotImplementedError
 
 
-class DummyStreamingLLM(StreamingLLM):
-    """Dummy LLM for testing without API credentials."""
-    
-    def __init__(self, delay_ms: float = 50):
-        self.delay_ms = delay_ms / 1000.0  # Convert to seconds
-        
-    async def stream_assistant_reply(self, prompt: str) -> AsyncGenerator[str, None]:
-        """
-        Stream a dummy response with simulated latency.
-        
-        Args:
-            prompt: User input prompt
-            
-        Yields:
-            Text tokens with delays
-        """
-        # Create a dummy response based on the prompt
-        responses = [
-            "I understand your question about",
-            f"'{prompt}'. ",
-            "Let me think about this... ",
-            "Based on my analysis, ",
-            "I believe the answer is that ",
-            "this is a fascinating topic. ",
-            "There are several aspects to consider: ",
-            "First, we should look at the context. ",
-            "Second, there are practical implications. ",
-            "Finally, this leads us to conclude that ",
-            "your question touches on important concepts. ",
-            "I hope this helps clarify things!"
-        ]
-        
-        for token in responses:
-            yield token
-            await asyncio.sleep(self.delay_ms)
-
 
 class OpenAIStreamingLLM(StreamingLLM):
     """OpenAI streaming LLM integration."""
@@ -95,29 +59,30 @@ class OpenAIStreamingLLM(StreamingLLM):
             yield f"Error: {str(e)}"
 
 
-def create_streaming_llm(use_dummy: bool = True, openai_api_key: Optional[str] = None) -> StreamingLLM:
+def create_streaming_llm(openai_api_key: str) -> StreamingLLM:
     """
-    Factory function to create appropriate streaming LLM.
+    Factory function to create streaming LLM.
     
     Args:
-        use_dummy: Whether to use dummy LLM
-        openai_api_key: OpenAI API key if using real LLM
+        openai_api_key: OpenAI API key
         
     Returns:
         StreamingLLM instance
     """
-    if use_dummy:
-        return DummyStreamingLLM()
-    elif openai_api_key:
-        return OpenAIStreamingLLM(openai_api_key)
-    else:
-        # Fallback to dummy if no API key provided
-        return DummyStreamingLLM()
+    if not openai_api_key:
+        raise ValueError("OpenAI API key is required")
+    return OpenAIStreamingLLM(openai_api_key)
 
 
 async def test_streaming():
     """Test function for streaming LLM."""
-    llm = DummyStreamingLLM()
+    import os
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("Please set OPENAI_API_KEY environment variable")
+        return
+    
+    llm = create_streaming_llm(api_key)
     
     async for token in llm.stream_assistant_reply("Hello, how are you?"):
         print(token, end="", flush=True)

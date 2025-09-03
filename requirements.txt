@@ -9,3 +9,4 @@ python-dotenv>=1.0.0
 elevenlabs>=0.2.26
 asyncio-mqtt>=0.16.1
 openai>=1.102.0
+streamlit-mic-recorder>=0.0.8
