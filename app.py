@@ -16,7 +16,7 @@ import json
 # Set up logging (only once)
 logger = logging.getLogger(__name__)
 if not logger.handlers:  # Prevent duplicate handlers
-    logger.setLevel(logging.WARNING)  # Reduced from DEBUG to INFO
+    logger.setLevel(logging.DEBUG)  # Reduced from DEBUG to INFO
     handler = logging.StreamHandler()
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     handler.setFormatter(formatter)
@@ -99,6 +99,8 @@ def on_audio_frames(frames):
         logger.warning("on_audio_frames: empty frames")
         return
 
+    logger.info(f"🎤 on_audio_frames called with {len(frames)} frames")
+    
     for i, frame in enumerate(frames):
         try:
             arr = frame.to_ndarray()
@@ -110,7 +112,9 @@ def on_audio_frames(frames):
             # For optional file recording on the main thread:
             try:
                 raw_audio_q.put_nowait(arr.copy())  # 48kHz mono float32
-            except Exception:
+                logger.debug(f"🎤 Added audio chunk to raw_audio_q: {len(arr)} samples")
+            except Exception as e:
+                logger.warning(f"🎤 Failed to add to raw_audio_q: {e}")
                 pass
 
             # Resample to 16kHz for STT
@@ -1337,6 +1341,143 @@ def main():
 
     # Render chat history
     render_chat_history()
+
+    # 🎵 AUDIO PLAYBACK TEST PANEL (TEMPORARY - FOR DEBUGGING)
+    st.markdown("---")
+    st.subheader("🎵 Audio Playback Test Panel")
+    st.caption("This panel is for testing microphone recording - can be removed later")
+    
+    # Show current recording status
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Raw Audio Chunks", len(st.session_state.get("recorded_audio_data", [])))
+    with col2:
+        st.metric("Is Recording Audio", st.session_state.get("is_recording_audio", False))
+    with col3:
+        st.metric("Is Recording STT", st.session_state.get("is_recording", False))
+    with col4:
+        # Show WebRTC status
+        webrtc_status = "Unknown"
+        if hasattr(st.session_state, 'webrtc_ctx') and st.session_state.webrtc_ctx:
+            webrtc_status = "Active" if st.session_state.webrtc_ctx.state.playing else "Inactive"
+        st.metric("WebRTC Status", webrtc_status)
+    
+    # Manual recording controls for testing
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        if st.button("🎤 Start Test Recording", key="test_start_recording"):
+            st.session_state.is_recording_audio = True
+            st.session_state.recorded_audio_data = []
+            st.success("Started test recording!")
+            st.rerun()
+    
+    with col2:
+        if st.button("⏹️ Stop Test Recording", key="test_stop_recording"):
+            st.session_state.is_recording_audio = False
+            st.success("Stopped test recording!")
+            st.rerun()
+    
+    with col3:
+        if st.button("🗑️ Clear Audio Data", key="test_clear_audio"):
+            st.session_state.recorded_audio_data = []
+            st.success("Cleared audio data!")
+            st.rerun()
+    
+    with col4:
+        if st.button("⏹️ Disable Recording", key="test_disable_recording"):
+            st.session_state.is_recording_audio = False
+            st.success("Recording disabled!")
+            st.rerun()
+    
+    # Test callback button (full width)
+    if st.button("🧪 Test Audio Callback", key="test_audio_callback"):
+            # Test the audio callback directly
+            try:
+                from av import AudioFrame
+                import numpy as np
+                
+                # Enable recording for the test
+                st.session_state.is_recording_audio = True
+                st.session_state.recorded_audio_data = []
+                
+                # Create a dummy audio frame (2D array required)
+                dummy_frame = AudioFrame.from_ndarray(
+                    np.random.randn(1, 1024).astype(np.float32), 
+                    format='flt', 
+                    layout='mono'
+                )
+                
+                # Call the callback
+                on_audio_frames([dummy_frame])
+                st.success("🧪 Audio callback test completed - recording enabled for test!")
+                st.rerun()
+                
+            except Exception as e:
+                st.error(f"❌ Audio callback test failed: {e}")
+    
+    # Show recorded audio data info
+    if st.session_state.get("recorded_audio_data"):
+        st.info(f"📊 Recorded {len(st.session_state.recorded_audio_data)} audio chunks")
+        
+        # Calculate total duration (assuming 48kHz, float32)
+        total_samples = sum(len(chunk) // 4 for chunk in st.session_state.recorded_audio_data)  # 4 bytes per float32
+        duration_seconds = total_samples / 48000
+        st.info(f"⏱️ Total duration: {duration_seconds:.2f} seconds")
+    else:
+        st.info("📊 No recorded audio data yet")
+    
+    # Debug: Show if background thread is running
+    if st.session_state.get("audio_consumer_started"):
+        st.success("✅ Background audio consumer thread is running")
+    else:
+        st.warning("⚠️ Background audio consumer thread not started")
+    
+    # Manual test: Try to drain the queue manually
+    if st.button("🔄 Manual Queue Drain Test", key="manual_drain_test"):
+        try:
+            drained = 0
+            while True:
+                try:
+                    chunk = raw_audio_q.get_nowait()
+                    st.session_state.recorded_audio_data.append(chunk)
+                    drained += 1
+                except Empty:
+                    break
+            if drained > 0:
+                st.success(f"✅ Manually drained {drained} chunks from queue!")
+            else:
+                st.info("ℹ️ No chunks in queue to drain")
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ Manual drain test failed: {e}")
+        
+        # Save and play button
+        if st.button("💾 Save & Play Test Audio", key="test_save_play"):
+            try:
+                filename = save_recorded_audio()
+                if filename:
+                    st.success(f"✅ Audio saved as: {filename}")
+                    st.audio(filename)
+                else:
+                    st.error("❌ Failed to save audio")
+            except Exception as e:
+                st.error(f"❌ Error saving audio: {e}")
+    
+    # Show recent raw audio queue status
+    try:
+        raw_queue_size = raw_audio_q.qsize()
+        st.info(f"🔄 Raw audio queue size: {raw_queue_size}")
+        
+        # Show more debug info
+        if raw_queue_size > 0:
+            st.success(f"✅ Audio is being captured! Queue has {raw_queue_size} chunks")
+        else:
+            st.warning("⚠️ No audio chunks in queue - WebRTC might not be working")
+            
+    except Exception as e:
+        st.error(f"❌ Raw audio queue error: {e}")
+    
+    st.markdown("---")
 
     st.info("Click **Start** in the audio player once, then messages will stream with voice.")
 
