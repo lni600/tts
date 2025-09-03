@@ -773,15 +773,13 @@ def render_webrtc_player():
     if "audio_frame_generator" in st.session_state:
         try:
             webrtc_ctx = safe_webrtc_streamer(
-                key="speech",
-                mode=WebRtcMode.SENDONLY,
-                source_audio_track=st.session_state.audio_frame_generator,
-                media_stream_constraints={"video": False, "audio": True},
+                key="player",
+                mode=WebRtcMode.RECVONLY,
+                source_audio_track=st.session_state.audio_frame_generator,  # server → browser
+                media_stream_constraints={"video": False, "audio": False},
                 frontend_rtc_configuration=RTC_CFG,
                 server_rtc_configuration=RTC_CFG,
                 async_processing=True,
-                queued_audio_frames_callback=on_audio_frames,  # <— the correct way
-                audio_receiver_size=8,                         # small buffer
                 sendback_audio=False,                          # avoid echo
             )
         except Exception as e:
@@ -859,7 +857,7 @@ def render_stt_interface():
     try:
         webrtc_ctx = safe_webrtc_streamer(
             key="microphone",
-            mode=WebRtcMode.RECVONLY,
+            mode=WebRtcMode.SENDONLY,
             media_stream_constraints={
                 "video": False, 
                 "audio": {
@@ -872,7 +870,7 @@ def render_stt_interface():
             frontend_rtc_configuration=RTC_CFG,
             server_rtc_configuration=RTC_CFG,
             async_processing=True,
-            queued_audio_frames_callback=on_audio_frames,  # <— the correct way
+            queued_audio_frames_callback=on_audio_frames,  # mic → STT
             audio_receiver_size=8,                         # small buffer
             sendback_audio=False,                          # avoid echo
         )
