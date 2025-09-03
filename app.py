@@ -5,6 +5,7 @@ import streamlit as st
 import asyncio
 import os
 import logging
+import numpy as np
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from queue import Queue, Empty
@@ -30,10 +31,99 @@ import time
 import logging
 import threading, asyncio
 from streamlit.runtime.scriptrunner import add_script_run_ctx
+import signal
+from contextlib import contextmanager
 
-
-RTC_CFG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+# More robust WebRTC configuration with multiple STUN servers
+RTC_CFG = RTCConfiguration({
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+        {"urls": ["stun:stun2.l.google.com:19302"]},
+    ],
+    "iceCandidatePoolSize": 10,
+})
 audio_chunk_queue = Queue()
+
+if "mic_pcm_q" not in st.session_state:
+    st.session_state.mic_pcm_q = Queue()
+
+# Audio recording state
+if "recorded_audio_data" not in st.session_state:
+    st.session_state.recorded_audio_data = []
+if "is_recording_audio" not in st.session_state:
+    st.session_state.is_recording_audio = False
+
+def on_audio_frames(frames):
+    for frame in frames:
+        arr = frame.to_ndarray()           # shape: (channels, samples) or (samples,)
+        if arr.ndim == 2:                  # to mono
+            arr = arr.mean(axis=0)
+        # Convert to float32 in [-1, 1] if it isn't already
+        if arr.dtype != np.float32:
+            # int16 path
+            arr = (arr.astype(np.float32) / 32767.0)
+        
+        # Store original audio data for recording if enabled
+        if st.session_state.is_recording_audio:
+            st.session_state.recorded_audio_data.append(arr.copy())
+        
+        # (Optional) resample 48k -> 16k for your STT
+        try:
+            from scipy.signal import resample_poly
+            arr16k = resample_poly(arr, up=1, down=3)  # 48000 to 16000
+        except Exception:
+            # Fallback: naive decimation; works "ok" for speech
+            arr16k = arr[::3]
+        pcm16 = (np.clip(arr16k, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+        st.session_state.mic_pcm_q.put(pcm16)
+
+def save_recorded_audio():
+    """Save recorded audio data to a WAV file."""
+    if not st.session_state.recorded_audio_data:
+        return None
+    
+    try:
+        import soundfile as sf
+        from datetime import datetime
+        
+        # Concatenate all audio chunks
+        audio_data = np.concatenate(st.session_state.recorded_audio_data)
+        
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"user_recording_{timestamp}.wav"
+        
+        # Save as WAV file (48kHz, mono)
+        sf.write(filename, audio_data, 48000)
+        
+        # Clear recorded data
+        st.session_state.recorded_audio_data = []
+        
+        return filename
+    except ImportError:
+        st.error("soundfile library not available. Install with: pip install soundfile")
+        return None
+    except Exception as e:
+        st.error(f"Error saving audio: {e}")
+        return None
+
+def safe_webrtc_streamer(*args, **kwargs):
+    """Safely create a WebRTC streamer with error handling."""
+    try:
+        return webrtc_streamer(*args, **kwargs)
+    except Exception as e:
+        logger.error(f"WebRTC initialization failed: {e}")
+        return None
+
+def render_webrtc_fallback():
+    """Render a fallback interface when WebRTC fails."""
+    st.warning("⚠️ WebRTC connection failed. Using fallback mode.")
+    st.info("You can still use text input, but voice features are limited.")
+    
+    # Add a retry button
+    if st.button("🔄 Retry WebRTC Connection"):
+        st.rerun()
 
 # Page configuration
 st.set_page_config(
@@ -423,7 +513,7 @@ def render_webrtc_player():
 
     # Only render if we have an audio frame generator
     if "audio_frame_generator" in st.session_state:
-        webrtc_ctx = webrtc_streamer(
+        webrtc_ctx = safe_webrtc_streamer(
             key="speech",
             mode=WebRtcMode.SENDONLY,
             source_audio_track=st.session_state.audio_frame_generator,
@@ -431,7 +521,13 @@ def render_webrtc_player():
             frontend_rtc_configuration=RTC_CFG,
             server_rtc_configuration=RTC_CFG,
             async_processing=True,
+            queued_audio_frames_callback=on_audio_frames,  # <— the correct way
+            audio_receiver_size=8,                         # small buffer
+            sendback_audio=False,                          # avoid echo
         )
+        if webrtc_ctx is None:
+            st.error("Failed to initialize audio player. Please refresh the page and try again.")
+            st.info("If the problem persists, try using a different browser or check your internet connection.")
         st.session_state.webrtc_ctx = webrtc_ctx
     else:
         st.info("Initializing audio player...")
@@ -503,33 +599,73 @@ def render_stt_interface():
                 st.error(f"Error processing audio: {e}")
     
     # WebRTC receiver for microphone input
-    webrtc_ctx = webrtc_streamer(
+    webrtc_ctx = safe_webrtc_streamer(
         key="microphone",
-        mode=WebRtcMode.RECVONLY,
-        media_stream_constraints={"video": False, "audio": True},
+        mode=WebRtcMode.SENDONLY,
+        media_stream_constraints={
+            "video": False, 
+            "audio": {
+                "echoCancellation": True,
+                "noiseSuppression": True,
+                "autoGainControl": True,
+                "sampleRate": 16000
+            }
+        },
         frontend_rtc_configuration=RTC_CFG,
         server_rtc_configuration=RTC_CFG,
         async_processing=True,
+        queued_audio_frames_callback=on_audio_frames,  # <— the correct way
+        audio_receiver_size=8,                         # small buffer
+        sendback_audio=False,                          # avoid echo
     )
     
+    if webrtc_ctx is None:
+        st.error("Failed to initialize microphone. Please refresh the page and try again.")
+        st.info("If the problem persists, try using a different browser or check your internet connection.")
+        st.info("Make sure your browser allows microphone access for this site.")
+        
+        # Show fallback interface
+        render_webrtc_fallback()
+        return
+    
     # Store the WebRTC context in session state for debugging
-    if webrtc_ctx:
-        st.session_state.webrtc_mic_ctx = webrtc_ctx
+    st.session_state.webrtc_mic_ctx = webrtc_ctx
+    
+    # Add refresh button for WebRTC issues
+    col_refresh1, col_refresh2 = st.columns([1, 3])
+    with col_refresh1:
+        if st.button("🔄 Refresh WebRTC"):
+            # Clear WebRTC context to force reinitialization
+            if "webrtc_mic_ctx" in st.session_state:
+                del st.session_state.webrtc_mic_ctx
+            st.rerun()
+    
+    with col_refresh2:
+        st.info("💡 If WebRTC is stuck, click 'Refresh WebRTC' above")
     
     # Debug: Show WebRTC status
-    if webrtc_ctx and hasattr(webrtc_ctx, 'audio_receiver') and webrtc_ctx.audio_receiver:
-        st.success("✅ Microphone access granted")
-        webrtc_ctx.audio_receiver.add_track(audio_frame_callback)
-    elif webrtc_ctx and hasattr(webrtc_ctx, 'state'):
-        # Check if WebRTC is in a connected state
-        if webrtc_ctx.state == "PLAYING" or webrtc_ctx.state == "CONNECTED":
-            st.success("✅ Microphone access granted")
-            if hasattr(webrtc_ctx, 'audio_receiver') and webrtc_ctx.audio_receiver:
-                webrtc_ctx.audio_receiver.add_track(audio_frame_callback)
-        else:
-            st.info("🔄 WebRTC initializing... Please click 'Start' to enable microphone access")
+    if webrtc_ctx:
+        try:
+            # Check WebRTC state more comprehensively
+            webrtc_state = getattr(webrtc_ctx, 'state', None)
+            has_audio_receiver = hasattr(webrtc_ctx, 'audio_receiver') and webrtc_ctx.audio_receiver
+            
+            # Show current state for debugging
+            st.write(f"**WebRTC State:** {webrtc_state}")
+            st.write(f"**Has Audio Receiver:** {has_audio_receiver}")
+            
+            if webrtc_state in ["PLAYING", "CONNECTED"] or has_audio_receiver:
+                st.success("✅ Microphone access granted")
+            elif webrtc_state == "INITIALIZED":
+                st.info("🔄 WebRTC initialized - Click 'Start' to begin recording")
+            elif webrtc_state is None:
+                st.info("🔄 WebRTC initializing... Please wait")
+            else:
+                st.info(f"🔄 WebRTC state: {webrtc_state} - Please click 'Start' to enable microphone access")
+        except Exception as e:
+            st.error(f"Error checking WebRTC status: {e}")
     else:
-        st.info("🔄 WebRTC initializing... Please click 'Start' to enable microphone access")
+        st.error("❌ WebRTC context not available")
     
     # Connection controls
     if st.session_state.stt_service:
@@ -563,12 +699,33 @@ def render_stt_interface():
     # Recording controls
     col1, col2, col3 = st.columns([1, 1, 2])
     
+    # Audio recording status and controls
+    with col3:
+        if st.session_state.is_recording:
+            st.error("🔴 Recording...")
+            if st.session_state.is_recording_audio:
+                st.info(f"🎵 Audio recording: {len(st.session_state.recorded_audio_data)} chunks")
+        else:
+            st.info("⏸️ Not recording")
+        
+        # Audio recording toggle (only show when not recording)
+        if not st.session_state.is_recording:
+            audio_recording_enabled = st.checkbox(
+                "🎵 Save audio to file", 
+                value=st.session_state.get("audio_recording_enabled", True),
+                help="When enabled, your speech will be saved as a WAV file when you stop recording"
+            )
+            st.session_state.audio_recording_enabled = audio_recording_enabled
+    
     with col1:
         stats = st.session_state.stt_service.get_recording_stats() if st.session_state.stt_service else {"is_connected": False}
         if st.button("🎤 Start Recording", disabled=st.session_state.is_recording or not stats["is_connected"]):
             logger.info("Start recording button clicked")
             st.session_state.stt_service.start_recording()
             st.session_state.is_recording = True
+            # Only enable audio recording if the toggle is on
+            st.session_state.is_recording_audio = st.session_state.get("audio_recording_enabled", True)
+            st.session_state.recorded_audio_data = []  # Clear previous recording
             st.info("🎤 Recording started - speak now!")
             st.rerun()
     
@@ -577,7 +734,18 @@ def render_stt_interface():
             logger.info("Stop recording button clicked")
             st.session_state.stt_service.stop_recording()
             st.session_state.is_recording = False
+            st.session_state.is_recording_audio = False  # Stop audio recording
             st.session_state.transcription_timeout = False
+            
+            # Save recorded audio to file
+            if st.session_state.recorded_audio_data:
+                filename = save_recorded_audio()
+                if filename:
+                    st.success(f"🎵 Audio saved as: {filename}")
+                else:
+                    st.warning("⚠️ Failed to save audio file")
+            else:
+                st.info("ℹ️ No audio data recorded")
             
             # Show audio buffer size for debugging
             stats = st.session_state.stt_service.get_recording_stats()
