@@ -31,30 +31,41 @@ class ElevenLabsRealtimeClient:
         self.audio_buffer = b""  # Initialize audio buffer
         
     async def connect(self) -> bool:
-        """
-        Connect to ElevenLabs WebSocket endpoint.
-        
-        Returns:
-            True if connection successful
-        """
         try:
-            # ElevenLabs WebSocket URL
-            ws_url = f"wss://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}/stream-input"
-            
-            # Connection headers
+            # Force raw PCM at the desired rate and reduce buffering
+            qs = (
+                f"output_format=pcm_{self.sample_rate}"
+                "&auto_mode=true"
+                "&enable_logging=false"
+                "&sync_alignment=false"
+            )
+            ws_url = (
+                f"wss://api.elevenlabs.io/v1/text-to-speech/"
+                f"{self.voice_id}/stream-input?{qs}"
+            )
+
             headers = {
                 "xi-api-key": self.api_key,
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             }
-            
-            # Connect to WebSocket
+
             self.websocket = await websockets.connect(ws_url, additional_headers=headers)
-            
-            # For the new ElevenLabs WebSocket API, we don't need to send an initial config
-            # The connection is established and ready to receive text immediately
             self.connected = True
+
+            # Send a tiny init message to “wake” the stream (per docs)
+            init = {
+                "text": " ",
+                "voice_settings": {
+                    "stability": 0.9,
+                    "similarity_boost": 1.0,
+                    "style": 0.5,
+                    "use_speaker_boost": True,
+                    "speed": 0.9
+                }
+            }
+            await self.websocket.send(json.dumps(init))
+
             return True
-                
         except Exception as e:
             print(f"Connection error: {e}")
             self.connected = False
@@ -438,42 +449,24 @@ class ElevenLabsRealtimeClient:
         processed_audio = self.audio_buffer
         self.audio_buffer = b""
         return processed_audio
-    
+
     async def audio_chunks(self) -> AsyncGenerator[bytes, None]:
-        """
-        Async generator yielding audio chunks as they arrive.
-        Applies intelligent noise reduction and buffering for smooth speech.
-        
-        Yields:
-            PCM16 audio bytes
-        """
         if not self.connected or not self.websocket:
             return
-            
         try:
             async for message in self.websocket:
                 try:
                     data = json.loads(message)
-                    
-                    # Handle different message types
+
                     if "audio" in data and data["audio"] is not None:
-                        # Decode base64 audio
-                        audio_bytes = base64.b64decode(data["audio"])
-                        
-                        # Convert to PCM16 format with intelligent noise reduction
-                        pcm16_bytes = self._convert_audio_to_pcm16(audio_bytes)
-                        
-                        # Yield the processed audio immediately (no buffering loop)
-                        if pcm16_bytes and len(pcm16_bytes) > 0:
-                            yield pcm16_bytes
-                        
-                    elif "isFinal" in data and data["isFinal"]:
-                        # Final chunk - we're done
+                        # Bytes are already raw PCM s16 at self.sample_rate
+                        yield base64.b64decode(data["audio"])
+
+                    elif data.get("isFinal"):
                         break
-                        
+
                 except json.JSONDecodeError:
                     print(f"Invalid JSON message: {message}")
-                    
         except websockets.exceptions.ConnectionClosed:
             print("WebSocket connection closed")
             self.connected = False
@@ -482,6 +475,14 @@ class ElevenLabsRealtimeClient:
             self.connected = False
     
     async def finalize(self) -> None:
+        if self.connected and self.websocket:
+            await self._flush_text_buffer()
+            # Send a final empty text to flush any remaining audio
+            try:
+                await self.websocket.send(json.dumps({"text": ""}))
+            except Exception as e:
+                print(f"Error sending end signal: {e}")
+
         """Finalize the TTS generation."""
         if self.connected and self.websocket:
             # Flush any remaining text

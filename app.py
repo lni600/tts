@@ -6,6 +6,8 @@ import asyncio
 import os
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+from queue import Queue, Empty
+from fractions import Fraction
 
 # Import our modules
 from llm.streaming_llm import create_streaming_llm
@@ -16,8 +18,16 @@ from utils.zipper import build_conversation_zip
 
 # WebRTC imports
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+from aiortc.mediastreams import AudioStreamTrack
 import av
+import time
+import logging
+import threading, asyncio
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
+
+RTC_CFG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+audio_chunk_queue = Queue()
 
 # Page configuration
 st.set_page_config(
@@ -63,10 +73,7 @@ def initialize_session_state():
     
     if "current_audio_chunks" not in st.session_state:
         st.session_state.current_audio_chunks = []
-    
-    if "audio_queue_manager" not in st.session_state:
-        st.session_state.audio_queue_manager = AudioQueueManager()
-    
+
     if "connection_status" not in st.session_state:
         st.session_state.connection_status = "disconnected"
     
@@ -160,10 +167,12 @@ def render_chat_history():
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-
-
 async def process_user_message(user_input: str, sidebar_config: Dict[str, Any], config: Dict[str, Any]):
     """Process user message and generate streaming response with synchronized text + audio."""
+    # Ensure session state is initialized
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    
     # Add user message to history
     user_message = {
         "role": "user",
@@ -200,17 +209,46 @@ async def process_user_message(user_input: str, sidebar_config: Dict[str, Any], 
             return
         st.session_state.connection_status = "connected"
 
+        async def wait_for_player_ready(timeout_s=5):
+            import time, asyncio
+            start = time.time()
+            while time.time() - start < timeout_s:
+                ctx = st.session_state.get("webrtc_ctx")
+                if ctx:
+                    # Check if the WebRTC context is initialized
+                    if hasattr(ctx, 'state') and ctx.state is not None:
+                        # If it's playing, great! If not, that's also okay - it will start when audio arrives
+                        return True
+                    # Also check if peer connection exists (even if not connected yet)
+                    pc = getattr(ctx, "peer_connection", None)
+                    if pc is not None:
+                        return True
+                await asyncio.sleep(0.1)
+            return False
+
+        # after TTS connect succeeded
+        ready = await wait_for_player_ready()
+        if not ready:
+            st.info("WebRTC player initializing... audio will start when ready.")
+        
+        # Give the WebRTC player a moment to fully initialize
+        await asyncio.sleep(0.5)
+
         # Audio collection task
         async def collect_audio():
             try:
                 chunk_count = 0
                 total_bytes = 0
                 async for chunk in tts_client.audio_chunks():
+                    if chunk and "logged_fmt" not in st.session_state:
+                        st.session_state["logged_fmt"] = True
+                        st.write(f"First 8 bytes: {chunk[:8]!r}, len={len(chunk)}")
+
                     st.session_state.current_audio_chunks.append(chunk)
-                    st.session_state.audio_queue_manager.put_audio(chunk)
                     chunk_count += 1
                     total_bytes += len(chunk)
-                    # Audio chunk collected
+                    # NEW: feed the WebRTC player
+                    audio_chunk_queue.put(chunk)
                 
                 print(f"Audio collection completed: {chunk_count} chunks, {total_bytes} total bytes")
             except Exception as e:
@@ -236,7 +274,7 @@ async def process_user_message(user_input: str, sidebar_config: Dict[str, Any], 
         audio_path = ""
         
         if st.session_state.current_audio_chunks:
-            audio_path = save_audio_chunks(st.session_state.current_audio_chunks)
+            audio_path = save_audio_chunks(st.session_state.current_audio_chunks, config)
         else:
             print("No audio chunks to save!")
 
@@ -250,10 +288,7 @@ async def process_user_message(user_input: str, sidebar_config: Dict[str, Any], 
         st.session_state.messages.append(assistant_message)
 
         text_placeholder.markdown(f"**Assistant:** {current_text}")
-        if audio_path:
-            st.audio(audio_path, format="audio/wav")
-        else:
-            st.warning("⚠️ Audio was generated but could not be saved/displayed")
+        st.session_state.current_audio_chunks = []
 
     except Exception as e:
         st.error(f"Error processing message: {e}")
@@ -265,7 +300,7 @@ async def process_user_message(user_input: str, sidebar_config: Dict[str, Any], 
             pass
 
 
-def save_audio_chunks(chunks: List[bytes]) -> str:
+def save_audio_chunks(chunks: List[bytes], config: Dict[str, Any]) -> str:
     """Save audio chunks to WAV file."""
     try:
         # Create temp directory if it doesn't exist
@@ -278,7 +313,7 @@ def save_audio_chunks(chunks: List[bytes]) -> str:
         filepath = os.path.join(temp_dir, filename)
         
         # Write WAV file
-        write_wav(chunks, filepath, sample_rate=16000)
+        write_wav(chunks, filepath, sample_rate=config["tts_sample_rate"])
         
         # Verify file was created
         if os.path.exists(filepath):
@@ -316,32 +351,113 @@ def save_conversation():
         st.error(f"Error saving conversation: {e}")
 
 
-def render_webrtc_player():
-    """Render WebRTC audio player."""
-    st.markdown("### 🔊 Audio Player")
-    
-    # WebRTC configuration
-    rtc_configuration = RTCConfiguration({
-        "iceServers": [
-            {"urls": ["stun:stun.l.google.com:19302"]},
-            {"urls": ["stun:stun1.l.google.com:19302"]}
-        ]
-    })
-    
-    audio_queue = st.session_state.audio_queue_manager.create_queue()
-    track = get_track(audio_queue, sample_rate=16000, chunk_duration_ms=20)
+class AudioFrameGenerator(AudioStreamTrack):
+    def __init__(self, sample_rate: int = 16000, frame_ms: int = 20):
+        super().__init__()
+        self.audio_chunk_queue = audio_chunk_queue
+        self.sample_rate = sample_rate
+        self.bytes_per_sample = 2  # s16
+        self.frame_bytes = int(self.sample_rate * self.bytes_per_sample * frame_ms / 1000)
+        self.last_chunk_time = time.time()
+        self.current_audio = b""
+        self.first_chunk_received = False
+        # NEW: Add timing for proper audio pacing
+        self.time_base = Fraction(1, self.sample_rate)
+        self._pts = 0
 
-    # Create WebRTC streamer
-    webrtc_streamer(
-        key="audio-player",
-        mode=WebRtcMode.RECVONLY,
-        frontend_rtc_configuration=rtc_configuration,
-        server_rtc_configuration=rtc_configuration,
-        media_stream_constraints={"video": False, "audio": True},
-        source_audio_track=track,
-        async_processing=True,
+    async def recv(self) -> av.AudioFrame:
+        import logging, asyncio
+        logger = logging.getLogger(__name__)
+
+        # Fill buffer up to one frame
+        while len(self.current_audio) < self.frame_bytes:
+            try:
+                chunk = self.audio_chunk_queue.get(timeout=0.1)
+                if not self.first_chunk_received:
+                    logger.info("First audio chunk received by player.")
+                    self.first_chunk_received = True
+                self.current_audio += chunk
+            except Empty:
+                await asyncio.sleep(0.01)
+
+        frame_data = self.current_audio[:self.frame_bytes]
+        self.current_audio = self.current_audio[self.frame_bytes:]
+
+        samples = len(frame_data) // self.bytes_per_sample
+        frame = av.AudioFrame(format="s16", layout="mono", samples=samples)
+        frame.sample_rate = self.sample_rate
+        frame.planes[0].update(frame_data)
+
+        # NEW: timestamp & pacing
+        frame.pts = self._pts
+        frame.time_base = self.time_base
+        self._pts += samples
+        await asyncio.sleep(samples / self.sample_rate)
+
+        return frame
+
+
+def render_webrtc_player():
+    if "webrtc_ctx" not in st.session_state:
+        st.session_state.webrtc_ctx = None
+
+    # Only render if we have an audio frame generator
+    if "audio_frame_generator" in st.session_state:
+        webrtc_ctx = webrtc_streamer(
+            key="speech",
+            mode=WebRtcMode.SENDONLY,
+            source_audio_track=st.session_state.audio_frame_generator,
+            media_stream_constraints={"video": False, "audio": True},
+            frontend_rtc_configuration=RTC_CFG,
+            server_rtc_configuration=RTC_CFG,
+            async_processing=True,
+        )
+        st.session_state.webrtc_ctx = webrtc_ctx
+    else:
+        st.info("Initializing audio player...")
+
+
+def generate_and_queue_audio(llm_response_generator, tts_model, tts_settings):
+    """
+    Generates audio from the LLM response stream and puts it into a queue.
+    This function is intended to be run in a separate thread.
+    """
+    logger = logging.getLogger(__name__)
+
+    # Get the audio stream from the TTS model
+    audio_chunks = tts_model.stream_tts_from_llm(
+        llm_response_generator,
+        **tts_settings
     )
 
+    total_chunks = 0
+    total_bytes = 0
+
+    # Iterate through the audio chunks and put them in the queue
+    for chunk in audio_chunks:
+        audio_chunk_queue.put(chunk)
+        total_chunks += 1
+        total_bytes += len(chunk)
+
+    logger.info(f"Audio generation completed: {total_chunks} chunks, {total_bytes} total bytes")
+
+
+def on_streaming_start():
+    st.session_state.streaming = True
+    st.session_state.llm_response_text = ""
+
+
+def on_streaming_stop():
+    st.session_state.streaming = False
+
+def fire(coro):
+    """Fire a coroutine from a daemon thread."""
+    threading.Thread(target=lambda: asyncio.run(coro), daemon=True).start()
+
+def run_coro_in_thread(coro):
+    t = threading.Thread(target=lambda: asyncio.run(coro), daemon=True)
+    add_script_run_ctx(t)  # <-- critical
+    t.start()
 
 def main():
     """Main application function."""
@@ -350,6 +466,13 @@ def main():
 
     # Get configuration
     config = get_config_from_secrets()
+
+    # Create audio generator with correct sample rate & frame size
+    if "audio_frame_generator" not in st.session_state:
+        st.session_state.audio_frame_generator = AudioFrameGenerator(
+            sample_rate=config["tts_sample_rate"],
+            frame_ms=config["tts_chunk_size_ms"],
+        )
 
     # Render header
     render_header()
@@ -360,18 +483,15 @@ def main():
     # Render chat history
     render_chat_history()
 
-    # Chat input
-    if prompt := st.chat_input("Type your message here..."):
-        if True:  # We always recreate services per message
-            try:
-                asyncio.run(process_user_message(prompt, sidebar_config, config))
-            except Exception as e:
-                st.error(f"Error processing message: {e}")
-        else:
-            st.error("Please initialize services first!")
+    st.info("Click **Start** in the audio player once, then messages will stream with voice.")
 
     # WebRTC audio player
     render_webrtc_player()
+
+    # Chat input
+    if prompt := st.chat_input("Type your message here..."):
+        # fire(process_user_message(prompt, sidebar_config, config))
+        run_coro_in_thread(process_user_message(prompt, sidebar_config, config))
 
     # System status
     with st.expander("🔧 System Status"):
@@ -380,6 +500,13 @@ def main():
             "message_count": len(st.session_state.messages),
             "audio_chunks_ready": len(st.session_state.current_audio_chunks) > 0,
         })
+    
+    # WebRTC debug
+    with st.expander("🔧 WebRTC"):
+        ctx = st.session_state.get("webrtc_ctx")
+        st.write("WebRTC State:", getattr(ctx, "state", None))
+        if ctx:
+            st.write("WebRTC Context:", ctx)
 
 
 
