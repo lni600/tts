@@ -86,11 +86,9 @@ def on_audio_frames(frames):
         if arr.dtype != np.float32:
             arr = (arr.astype(np.float32) / 32767.0)
 
-        # Save raw 48k audio chunks for optional local recording
         if st.session_state.is_recording_audio:
             st.session_state.recorded_audio_data.append(arr.copy())
 
-        # Resample 48k -> 16k for STT
         try:
             from scipy.signal import resample_poly
             arr16k = resample_poly(arr, up=1, down=3)
@@ -98,43 +96,14 @@ def on_audio_frames(frames):
             arr16k = arr[::3]
 
         pcm16 = (np.clip(arr16k, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-
-        # (Optional) keep queue if you need it elsewhere
         st.session_state.mic_pcm_q.put(pcm16)
 
-        # 🔴 CRITICAL: forward to STT when recording
-        if (
-            st.session_state.get("stt_service")
-            and st.session_state.get("is_recording")
-        ):
+        # Forward to STT when recording (non-blocking)
+        if st.session_state.get("stt_service") and st.session_state.get("is_recording"):
             try:
-                # non-blocking: run coroutine in your background thread helper
                 run_coro_in_thread(st.session_state.stt_service.process_audio_data(pcm16))
             except Exception as e:
                 logger.error(f"Error forwarding audio to STT: {e}")
-
-    for frame in frames:
-        arr = frame.to_ndarray()           # shape: (channels, samples) or (samples,)
-        if arr.ndim == 2:                  # to mono
-            arr = arr.mean(axis=0)
-        # Convert to float32 in [-1, 1] if it isn't already
-        if arr.dtype != np.float32:
-            # int16 path
-            arr = (arr.astype(np.float32) / 32767.0)
-        
-        # Store original audio data for recording if enabled
-        if st.session_state.is_recording_audio:
-            st.session_state.recorded_audio_data.append(arr.copy())
-        
-        # (Optional) resample 48k -> 16k for your STT
-        try:
-            from scipy.signal import resample_poly
-            arr16k = resample_poly(arr, up=1, down=3)  # 48000 to 16000
-        except Exception:
-            # Fallback: naive decimation; works "ok" for speech
-            arr16k = arr[::3]
-        pcm16 = (np.clip(arr16k, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-        st.session_state.mic_pcm_q.put(pcm16)
 
 def save_recorded_audio():
     """Save recorded audio data to a WAV file."""
@@ -184,28 +153,22 @@ def safe_webrtc_streamer(*args, **kwargs):
         return None
 
 def cleanup_webrtc_connections():
-    """Clean up WebRTC connections to prevent ICE errors."""
+    """Clean up WebRTC connections to prevent ICE timer crashes."""
     try:
-        # Clean up audio player WebRTC context
-        if "webrtc_ctx" in st.session_state and st.session_state.webrtc_ctx:
-            try:
-                if hasattr(st.session_state.webrtc_ctx, 'close'):
-                    st.session_state.webrtc_ctx.close()
-            except Exception as e:
-                logger.warning(f"Error closing audio player WebRTC: {e}")
-            finally:
-                st.session_state.webrtc_ctx = None
-        
-        # Clean up microphone WebRTC context
-        if "webrtc_mic_ctx" in st.session_state and st.session_state.webrtc_mic_ctx:
-            try:
-                if hasattr(st.session_state.webrtc_mic_ctx, 'close'):
-                    st.session_state.webrtc_mic_ctx.close()
-            except Exception as e:
-                logger.warning(f"Error closing microphone WebRTC: {e}")
-            finally:
-                st.session_state.webrtc_mic_ctx = None
-                
+        for key in ("webrtc_ctx", "webrtc_mic_ctx"):
+            ctx = st.session_state.get(key)
+            if ctx:
+                try:
+                    # stop() gracefully cancels aioice timers and closes transports
+                    if getattr(ctx, "state", None) and getattr(ctx.state, "playing", False):
+                        ctx.stop()
+                    else:
+                        # stop anyway; safe when not playing
+                        ctx.stop()
+                except Exception as e:
+                    logger.warning(f"Error stopping WebRTC ({key}): {e}")
+                finally:
+                    st.session_state[key] = None
         logger.info("WebRTC connections cleaned up")
     except Exception as e:
         logger.error(f"Error during WebRTC cleanup: {e}")
@@ -832,12 +795,14 @@ def render_stt_interface():
                     if hasattr(st.session_state, 'transcription_start_time'):
                         del st.session_state.transcription_start_time
                     st.success(f"🎉 Transcription received: {text.strip()}")
-                    st.rerun()
+                    st.session_state._needs_rerun = True
                 else:
                     st.warning("⚠️ Empty transcription received")
             
             def on_error(error):
                 st.error(f"STT Error: {error}")
+                st.session_state.last_stt_error = str(error)
+                st.session_state._needs_rerun = True
             
             st.session_state.stt_service.set_transcription_callback(on_transcription)
             st.session_state.stt_service.set_error_callback(on_error)
@@ -943,25 +908,14 @@ def render_stt_interface():
             if not stats["is_connected"]:
                 if st.button("🔌 Connect to OpenAI"):
                     with st.spinner("Connecting..."):
-                        import asyncio
-                        try:
-                            asyncio.run(st.session_state.stt_service.connect())
-                            st.success("Connected successfully!")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Connection failed: {e}")
+                        run_coro_in_thread(st.session_state.stt_service.connect())
         
         with col_conn2:
             if stats["is_connected"]:
                 if st.button("🔌 Disconnect"):
                     with st.spinner("Disconnecting..."):
-                        import asyncio
-                        try:
-                            asyncio.run(st.session_state.stt_service.disconnect())
-                            st.success("Disconnected successfully!")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Disconnection failed: {e}")
+                        run_coro_in_thread(st.session_state.stt_service.disconnect())
+                        st.session_state._needs_rerun = True
     
     # Recording controls
     col1, col2, col3 = st.columns([1, 1, 2])
@@ -1017,19 +971,22 @@ def render_stt_interface():
             # Show audio buffer size for debugging
             stats = st.session_state.stt_service.get_recording_stats()
             st.info(f"📊 Audio buffer size: {stats.get('recorded_audio_size', 0)} bytes")
-            
-            # Transcribe the recorded audio
+
+            # Commit audio for transcription
             with st.spinner("🔄 Processing audio..."):
-                import asyncio
-                result = asyncio.run(st.session_state.stt_service.commit_audio_for_transcription())
-                if result["success"]:
-                    st.info("🎯 Audio sent for transcription - waiting for results...")
-                    # Set a timeout flag to show manual option if transcription doesn't come back
-                    import time
-                    st.session_state.transcription_start_time = time.time()
-                else:
-                    st.error(f"❌ Transcription failed: {result.get('error', 'Unknown error')}")
-            st.rerun()
+                fut = threading.Event()
+                result_holder = {}
+
+                def _runner():
+                    res = asyncio.run(st.session_state.stt_service.commit_audio_for_transcription())
+                    result_holder["res"] = res
+                    fut.set()
+
+                t = threading.Thread(target=_runner, daemon=True)
+                add_script_run_ctx(t)
+                t.start()
+                fut.wait()
+                result = result_holder["res"]
     
     with col3:
         if st.session_state.is_recording:
@@ -1209,6 +1166,12 @@ def main():
             if hasattr(mic_ctx, 'audio_receiver'):
                 st.write("Audio receiver:", mic_ctx.audio_receiver)
             st.write("Available attributes:", [attr for attr in dir(mic_ctx) if not attr.startswith('_')])
+
+    # Trigger one rerun on the main thread if any callback asked for it
+    if st.session_state.pop("_needs_rerun", False):
+        # Important: stop WebRTC first to avoid timer races during rerun
+        cleanup_webrtc_connections()
+        st.rerun()
 
 
 
