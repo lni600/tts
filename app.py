@@ -512,12 +512,24 @@ def render_stt_interface():
         async_processing=True,
     )
     
+    # Store the WebRTC context in session state for debugging
+    if webrtc_ctx:
+        st.session_state.webrtc_mic_ctx = webrtc_ctx
+    
     # Debug: Show WebRTC status
-    if webrtc_ctx.audio_receiver:
+    if webrtc_ctx and hasattr(webrtc_ctx, 'audio_receiver') and webrtc_ctx.audio_receiver:
         st.success("✅ Microphone access granted")
         webrtc_ctx.audio_receiver.add_track(audio_frame_callback)
+    elif webrtc_ctx and hasattr(webrtc_ctx, 'state'):
+        # Check if WebRTC is in a connected state
+        if webrtc_ctx.state == "PLAYING" or webrtc_ctx.state == "CONNECTED":
+            st.success("✅ Microphone access granted")
+            if hasattr(webrtc_ctx, 'audio_receiver') and webrtc_ctx.audio_receiver:
+                webrtc_ctx.audio_receiver.add_track(audio_frame_callback)
+        else:
+            st.info("🔄 WebRTC initializing... Please click 'Start' to enable microphone access")
     else:
-        st.warning("⚠️ Microphone access not available - please allow microphone access in your browser")
+        st.info("🔄 WebRTC initializing... Please click 'Start' to enable microphone access")
     
     # Connection controls
     if st.session_state.stt_service:
@@ -739,13 +751,28 @@ def main():
         })
     
     # WebRTC debug
-    with st.expander("🔧 WebRTC"):
+    with st.expander("🔧 WebRTC Debug"):
+        # Audio player context
         ctx = st.session_state.get("webrtc_ctx")
-        st.write("WebRTC State:", getattr(ctx, "state", None))
+        st.write("**Audio Player WebRTC:**")
+        st.write("State:", getattr(ctx, "state", None))
         if ctx:
-            st.write("WebRTC Context:", ctx)
+            st.write("Has audio_receiver:", hasattr(ctx, 'audio_receiver'))
+            if hasattr(ctx, 'audio_receiver'):
+                st.write("Audio receiver:", ctx.audio_receiver)
+        
+        # Microphone context
+        mic_ctx = st.session_state.get("webrtc_mic_ctx")
+        st.write("**Microphone WebRTC:**")
+        st.write("State:", getattr(mic_ctx, "state", None))
+        if mic_ctx:
+            st.write("Has audio_receiver:", hasattr(mic_ctx, 'audio_receiver'))
+            if hasattr(mic_ctx, 'audio_receiver'):
+                st.write("Audio receiver:", mic_ctx.audio_receiver)
+            st.write("Available attributes:", [attr for attr in dir(mic_ctx) if not attr.startswith('_')])
 
 
 
 if __name__ == "__main__":
     main()
+
