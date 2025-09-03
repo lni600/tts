@@ -854,24 +854,6 @@ def render_stt_interface():
     
     # WebRTC microphone capture
     st.write("**Microphone Access:**")
-        """Callback for processing audio frames from microphone."""
-        if st.session_state.stt_service and st.session_state.is_recording:
-            # Convert frame to bytes and process
-            audio_data = frame.to_ndarray()
-            if len(audio_data.shape) > 1:
-                audio_data = audio_data.mean(axis=0)  # Convert to mono
-            audio_bytes = (audio_data * 32767).astype('int16').tobytes()
-            
-            # Debug: Log audio frame info
-            logger.info(f"Processing audio frame: {len(audio_bytes)} bytes, shape: {audio_data.shape}")
-            
-            # Process audio data asynchronously
-            import asyncio
-            try:
-                asyncio.run(st.session_state.stt_service.process_audio_data(audio_bytes))
-            except Exception as e:
-                logger.error(f"Error processing audio: {e}")
-                st.error(f"Error processing audio: {e}")
     
     # WebRTC receiver for microphone input with better error handling
     try:
