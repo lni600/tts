@@ -36,20 +36,36 @@ import threading, asyncio
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 import signal
 from contextlib import contextmanager
+import atexit
 
-# More robust WebRTC configuration with multiple STUN servers
+# More robust WebRTC configuration with multiple STUN servers and better error handling
 RTC_CFG = RTCConfiguration({
     "iceServers": [
         {"urls": ["stun:stun.l.google.com:19302"]},
         {"urls": ["stun:stun1.l.google.com:19302"]},
         {"urls": ["stun:stun2.l.google.com:19302"]},
+        {"urls": ["stun:stun3.l.google.com:19302"]},
+        {"urls": ["stun:stun4.l.google.com:19302"]},
     ],
     "iceCandidatePoolSize": 10,
+    "iceTransportPolicy": "all",
+    "bundlePolicy": "max-bundle",
+    "rtcpMuxPolicy": "require",
 })
 audio_chunk_queue = Queue()
 
 if "mic_pcm_q" not in st.session_state:
     st.session_state.mic_pcm_q = Queue()
+
+# Register cleanup function to run on app exit
+def cleanup_on_exit():
+    """Clean up WebRTC connections on app exit."""
+    try:
+        cleanup_webrtc_connections()
+    except Exception as e:
+        logger.error(f"Error during exit cleanup: {e}")
+
+atexit.register(cleanup_on_exit)
 
 # Audio recording state
 if "recorded_audio_data" not in st.session_state:
@@ -58,6 +74,40 @@ if "is_recording_audio" not in st.session_state:
     st.session_state.is_recording_audio = False
 
 def on_audio_frames(frames):
+    for frame in frames:
+        arr = frame.to_ndarray()
+        if arr.ndim == 2:
+            arr = arr.mean(axis=0)
+        if arr.dtype != np.float32:
+            arr = (arr.astype(np.float32) / 32767.0)
+
+        # Save raw 48k audio chunks for optional local recording
+        if st.session_state.is_recording_audio:
+            st.session_state.recorded_audio_data.append(arr.copy())
+
+        # Resample 48k -> 16k for STT
+        try:
+            from scipy.signal import resample_poly
+            arr16k = resample_poly(arr, up=1, down=3)
+        except Exception:
+            arr16k = arr[::3]
+
+        pcm16 = (np.clip(arr16k, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+
+        # (Optional) keep queue if you need it elsewhere
+        st.session_state.mic_pcm_q.put(pcm16)
+
+        # 🔴 CRITICAL: forward to STT when recording
+        if (
+            st.session_state.get("stt_service")
+            and st.session_state.get("is_recording")
+        ):
+            try:
+                # non-blocking: run coroutine in your background thread helper
+                run_coro_in_thread(st.session_state.stt_service.process_audio_data(pcm16))
+            except Exception as e:
+                logger.error(f"Error forwarding audio to STT: {e}")
+
     for frame in frames:
         arr = frame.to_ndarray()           # shape: (channels, samples) or (samples,)
         if arr.ndim == 2:                  # to mono
@@ -114,19 +164,62 @@ def save_recorded_audio():
 def safe_webrtc_streamer(*args, **kwargs):
     """Safely create a WebRTC streamer with error handling."""
     try:
+        # Add timeout and better error handling
+        kwargs.setdefault('frontend_rtc_configuration', RTC_CFG)
+        kwargs.setdefault('server_rtc_configuration', RTC_CFG)
+        kwargs.setdefault('media_stream_constraints', {"video": False, "audio": True})
+        kwargs.setdefault('async_processing', True)
+        
         return webrtc_streamer(*args, **kwargs)
     except Exception as e:
         logger.error(f"WebRTC initialization failed: {e}")
+        # Log more details about the error
+        import traceback
+        logger.error(f"WebRTC error traceback: {traceback.format_exc()}")
         return None
+
+def cleanup_webrtc_connections():
+    """Clean up WebRTC connections to prevent ICE errors."""
+    try:
+        # Clean up audio player WebRTC context
+        if "webrtc_ctx" in st.session_state and st.session_state.webrtc_ctx:
+            try:
+                if hasattr(st.session_state.webrtc_ctx, 'close'):
+                    st.session_state.webrtc_ctx.close()
+            except Exception as e:
+                logger.warning(f"Error closing audio player WebRTC: {e}")
+            finally:
+                st.session_state.webrtc_ctx = None
+        
+        # Clean up microphone WebRTC context
+        if "webrtc_mic_ctx" in st.session_state and st.session_state.webrtc_mic_ctx:
+            try:
+                if hasattr(st.session_state.webrtc_mic_ctx, 'close'):
+                    st.session_state.webrtc_mic_ctx.close()
+            except Exception as e:
+                logger.warning(f"Error closing microphone WebRTC: {e}")
+            finally:
+                st.session_state.webrtc_mic_ctx = None
+                
+        logger.info("WebRTC connections cleaned up")
+    except Exception as e:
+        logger.error(f"Error during WebRTC cleanup: {e}")
 
 def render_webrtc_fallback():
     """Render a fallback interface when WebRTC fails."""
     st.warning("⚠️ WebRTC connection failed. Using fallback mode.")
     st.info("You can still use text input, but voice features are limited.")
     
-    # Add a retry button
-    if st.button("🔄 Retry WebRTC Connection"):
-        st.rerun()
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🔄 Retry WebRTC Connection"):
+            cleanup_webrtc_connections()
+            st.rerun()
+    with col2:
+        if st.button("🧹 Cleanup & Retry"):
+            cleanup_webrtc_connections()
+            # Force a complete page refresh
+            st.experimental_rerun()
 
 # Page configuration
 st.set_page_config(
@@ -678,18 +771,24 @@ def render_webrtc_player():
 
     # Only render if we have an audio frame generator
     if "audio_frame_generator" in st.session_state:
-        webrtc_ctx = safe_webrtc_streamer(
-            key="speech",
-            mode=WebRtcMode.SENDONLY,
-            source_audio_track=st.session_state.audio_frame_generator,
-            media_stream_constraints={"video": False, "audio": True},
-            frontend_rtc_configuration=RTC_CFG,
-            server_rtc_configuration=RTC_CFG,
-            async_processing=True,
-            queued_audio_frames_callback=on_audio_frames,  # <— the correct way
-            audio_receiver_size=8,                         # small buffer
-            sendback_audio=False,                          # avoid echo
-        )
+        try:
+            webrtc_ctx = safe_webrtc_streamer(
+                key="speech",
+                mode=WebRtcMode.SENDONLY,
+                source_audio_track=st.session_state.audio_frame_generator,
+                media_stream_constraints={"video": False, "audio": True},
+                frontend_rtc_configuration=RTC_CFG,
+                server_rtc_configuration=RTC_CFG,
+                async_processing=True,
+                queued_audio_frames_callback=on_audio_frames,  # <— the correct way
+                audio_receiver_size=8,                         # small buffer
+                sendback_audio=False,                          # avoid echo
+            )
+        except Exception as e:
+            logger.error(f"Failed to create audio player WebRTC streamer: {e}")
+            import traceback
+            logger.error(f"WebRTC error traceback: {traceback.format_exc()}")
+            webrtc_ctx = None
         if webrtc_ctx is None:
             st.error("Failed to initialize audio player. Please refresh the page and try again.")
             st.info("If the problem persists, try using a different browser or check your internet connection.")
@@ -755,8 +854,6 @@ def render_stt_interface():
     
     # WebRTC microphone capture
     st.write("**Microphone Access:**")
-    
-    def audio_frame_callback(frame):
         """Callback for processing audio frames from microphone."""
         if st.session_state.stt_service and st.session_state.is_recording:
             # Convert frame to bytes and process
@@ -776,26 +873,32 @@ def render_stt_interface():
                 logger.error(f"Error processing audio: {e}")
                 st.error(f"Error processing audio: {e}")
     
-    # WebRTC receiver for microphone input
-    webrtc_ctx = safe_webrtc_streamer(
-        key="microphone",
-        mode=WebRtcMode.SENDONLY,
-        media_stream_constraints={
-            "video": False, 
-            "audio": {
-                "echoCancellation": True,
-                "noiseSuppression": True,
-                "autoGainControl": True,
-                "sampleRate": 16000
-            }
-        },
-        frontend_rtc_configuration=RTC_CFG,
-        server_rtc_configuration=RTC_CFG,
-        async_processing=True,
-        queued_audio_frames_callback=on_audio_frames,  # <— the correct way
-        audio_receiver_size=8,                         # small buffer
-        sendback_audio=False,                          # avoid echo
-    )
+    # WebRTC receiver for microphone input with better error handling
+    try:
+        webrtc_ctx = safe_webrtc_streamer(
+            key="microphone",
+            mode=WebRtcMode.RECVONLY,
+            media_stream_constraints={
+                "video": False, 
+                "audio": {
+                    "echoCancellation": True,
+                    "noiseSuppression": True,
+                    "autoGainControl": True,
+                    "sampleRate": 16000
+                }
+            },
+            frontend_rtc_configuration=RTC_CFG,
+            server_rtc_configuration=RTC_CFG,
+            async_processing=True,
+            queued_audio_frames_callback=on_audio_frames,  # <— the correct way
+            audio_receiver_size=8,                         # small buffer
+            sendback_audio=False,                          # avoid echo
+        )
+    except Exception as e:
+        logger.error(f"Failed to create microphone WebRTC streamer: {e}")
+        import traceback
+        logger.error(f"WebRTC error traceback: {traceback.format_exc()}")
+        webrtc_ctx = None
     
     if webrtc_ctx is None:
         st.error("Failed to initialize microphone. Please refresh the page and try again.")
@@ -810,16 +913,17 @@ def render_stt_interface():
     st.session_state.webrtc_mic_ctx = webrtc_ctx
     
     # Add refresh button for WebRTC issues
-    col_refresh1, col_refresh2 = st.columns([1, 3])
+    col_refresh1, col_refresh2, col_refresh3 = st.columns([1, 1, 2])
     with col_refresh1:
         if st.button("🔄 Refresh WebRTC"):
-            # Clear WebRTC context to force reinitialization
-            if "webrtc_mic_ctx" in st.session_state:
-                del st.session_state.webrtc_mic_ctx
+            cleanup_webrtc_connections()
             st.rerun()
-    
     with col_refresh2:
-        st.info("💡 If WebRTC is stuck, click 'Refresh WebRTC' above")
+        if st.button("🧹 Force Cleanup"):
+            cleanup_webrtc_connections()
+            st.experimental_rerun()
+    with col_refresh3:
+        st.info("💡 If WebRTC is stuck, try the cleanup buttons above")
     
     # Debug: Show WebRTC status
     if webrtc_ctx:
